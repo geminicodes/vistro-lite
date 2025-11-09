@@ -2,7 +2,7 @@
 
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 
-type AnySupabaseClient = SupabaseClient<any, 'public', any>;
+export type AnySupabaseClient = SupabaseClient<any, 'public', any>;
 
 let cachedClient: AnySupabaseClient | null = null;
 let fetchPolyfill: typeof fetch | undefined;
@@ -83,12 +83,13 @@ export interface TranslationMemoryEntry {
  */
 export const upsertTranslationMemory = async (
   entries: TranslationMemoryEntry[],
+  clientParam?: AnySupabaseClient,
 ): Promise<void> => {
   if (entries.length === 0) {
     return;
   }
 
-  const client = createSupabaseServiceClient();
+  const client = clientParam ?? createSupabaseServiceClient();
 
   const payload = entries.map((entry) => ({
     site_id: entry.siteId,
