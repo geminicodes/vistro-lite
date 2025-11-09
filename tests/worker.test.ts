@@ -18,6 +18,8 @@ interface MockDb {
 const mockCreateSupabaseServiceClient = vi.fn();
 const mockUpsertTranslationMemory = vi.fn();
 const mockTranslateBatch = vi.fn();
+const mockInfo = vi.fn();
+const mockWarn = vi.fn();
 
 vi.mock('../lib/supabaseServer', () => ({
   createSupabaseServiceClient: mockCreateSupabaseServiceClient,
@@ -26,6 +28,12 @@ vi.mock('../lib/supabaseServer', () => ({
 
 vi.mock('../lib/deeplClient', () => ({
   translateBatch: mockTranslateBatch,
+}));
+
+vi.mock('../lib/log', () => ({
+  info: mockInfo,
+  warn: mockWarn,
+  error: vi.fn(),
 }));
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));

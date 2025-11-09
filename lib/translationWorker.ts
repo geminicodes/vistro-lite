@@ -1,6 +1,8 @@
 'use server';
 
 import { translateBatch } from './deeplClient';
+import { info, warn } from './log';
+import { retryWithBackoff } from './retry';
 import {
   createSupabaseServiceClient,
   type AnySupabaseClient,
@@ -19,6 +21,19 @@ interface TranslationSegmentRow {
   job_id: string;
   source_lang: string | null;
   target_lang: string;
+
+const parseIntegerEnv = (value: string | undefined, fallback: number): number => {
+  if (!value) {
+    return fallback;
+  }
+
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+
+const WORKER_RETRIES = parseIntegerEnv(process.env.WORKER_TRANSLATE_RETRIES, 3);
+const WORKER_MIN_DELAY_MS = parseIntegerEnv(process.env.WORKER_TRANSLATE_MIN_MS, 500);
+const WORKER_MAX_DELAY_MS = parseIntegerEnv(process.env.WORKER_TRANSLATE_MAX_MS, 5_000);
   segment_hash: string;
   source_text: string;
   translated_text: string | null;
@@ -98,10 +113,25 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
   const updates: Array<{ id: string; job_id: string; translated_text: string }> = [];
   const memoryEntries: TranslationMemoryEntry[] = [];
 
+  info('Worker processing translation job', { jobId, groups: groupedSegments.size });
+
   for (const [targetLang, group] of groupedSegments.entries()) {
-    const translations = await translateBatch(
-      group.map((segment) => segment.source_text),
-      targetLang,
+    const translations = await retryWithBackoff(
+      () => translateBatch(group.map((segment) => segment.source_text), targetLang),
+      {
+        retries: WORKER_RETRIES,
+        minMs: WORKER_MIN_DELAY_MS,
+        maxMs: WORKER_MAX_DELAY_MS,
+        onRetry: (error, attempt, delay) => {
+          warn('Retrying translation batch', {
+            jobId,
+            targetLang,
+            attempt,
+            delayMs: delay,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      },
     );
 
     if (translations.length !== group.length) {
@@ -141,4 +171,5 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
   }
 
   await markJobCompleted(supabase, jobId);
+  info('Worker completed translation job', { jobId });
 };

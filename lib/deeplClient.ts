@@ -1,6 +1,7 @@
 'use server';
 
-import { setTimeout as sleepTimeout } from 'node:timers/promises';
+import { warn } from './log';
+import { retryWithBackoff } from './retry';
 
 const DEFAULT_BASE_URL = 'https://api-free.deepl.com/v2/translate';
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -18,8 +19,6 @@ interface DeepLConfig {
 interface DeepLTranslationResponse {
   translations: Array<{ text: string }>;
 }
-
-const sleep = (ms: number): Promise<void> => sleepTimeout(ms) as Promise<void>;
 
 const normalizeTargetLang = (targetLang: string): string => {
   const normalized = targetLang.trim().toUpperCase();
@@ -88,11 +87,9 @@ const requestDeepLChunk = async (
     return texts.map((text) => `${text} [${targetLang}]`);
   }
 
-  let attempt = 0;
   const { apiKey, baseUrl, timeoutMs, maxRetries } = config;
 
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
+  const executeRequest = async (attempt: number): Promise<string[]> => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const body = buildRequestBody(texts, targetLang);
@@ -111,19 +108,12 @@ const requestDeepLChunk = async (
       const responseText = await response.text();
 
       if (!response.ok) {
-        if (shouldRetryStatus(response.status) && attempt < maxRetries) {
-          const delay = Math.min(timeoutMs, 2 ** attempt * 1_000);
-          console.warn(
-            `[DeepL] Request failed with status ${response.status}. Retrying in ${delay}ms.`,
-          );
-          attempt += 1;
-          await sleep(delay);
-          continue;
-        }
-
-        throw new Error(
+        const error = new Error(
           `DeepL request failed with status ${response.status}: ${responseText || 'No response body.'}`,
-        );
+        ) as Error & { retryable: boolean; status?: number };
+        error.retryable = shouldRetryStatus(response.status);
+        error.status = response.status;
+        throw error;
       }
 
       let parsed: DeepLTranslationResponse;
@@ -146,36 +136,34 @@ const requestDeepLChunk = async (
 
       return translations;
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
-        if (attempt < maxRetries) {
-          const delay = Math.min(timeoutMs, 2 ** attempt * 1_000);
-          console.warn(`[DeepL] Request timed out. Retrying in ${delay}ms.`);
-          attempt += 1;
-          await sleep(delay);
-          continue;
-        }
-
-        throw new Error('DeepL request timed out.');
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        const abortError = new Error('DeepL request timed out.') as Error & { retryable: boolean };
+        abortError.retryable = true;
+        throw abortError;
       }
 
-      const errorMessage =
-        error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown error.';
-
-      if (attempt < maxRetries) {
-        const delay = Math.min(timeoutMs, 2 ** attempt * 1_000);
-        console.warn(`[DeepL] Request error: ${errorMessage}. Retrying in ${delay}ms.`);
-        attempt += 1;
-        await sleep(delay);
-        continue;
+      if (error instanceof Error && typeof (error as any).retryable === 'undefined') {
+        (error as any).retryable = true;
       }
 
-      throw new Error(
-        `DeepL request failed: ${errorMessage}`,
-      );
+      throw error;
     } finally {
       clearTimeout(timeout);
     }
-  }
+  };
+
+  return retryWithBackoff(executeRequest, {
+    retries: maxRetries,
+    minMs: Math.min(500, timeoutMs),
+    maxMs: timeoutMs,
+    onRetry: (error, attempt, delay) => {
+      warn('[DeepL] Retrying request', {
+        attempt,
+        delayMs: delay,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+  });
 };
 
 /**
