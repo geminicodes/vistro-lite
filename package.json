@@ -1,0 +1,24 @@
+{
+  "name": "vistro-lite",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.0",
+    "next": "14.1.0",
+    "node-html-parser": "^6.1.11",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5",
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2",
+    "vitest": "^1.0.4"
+  }
+}
