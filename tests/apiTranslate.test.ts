@@ -17,14 +17,15 @@ interface MockDb {
   job_queue: any[];
 }
 
-const mockCreateSupabaseServiceClient = vi.fn();
-
+const { mockCreateSupabaseServiceClient } = vi.hoisted(() => ({
+  mockCreateSupabaseServiceClient: vi.fn(),
+}));
+ 
 vi.mock('../lib/supabaseServer', () => ({
   createSupabaseServiceClient: mockCreateSupabaseServiceClient,
   upsertTranslationMemory: vi.fn(),
 }));
 
-const createMockSupabaseClient = (db: MockDb) => {
   const cloneRow = (row: any) => JSON.parse(JSON.stringify(row));
 
   const applyFilters = (rows: any[], filters: Array<(row: any) => boolean>) =>
@@ -161,8 +162,8 @@ describe('POST /api/translate', () => {
     });
 
     const response = await POST(request);
-    const json = await response.json();
-
+    const json = (await response.json()) as any;
+    
     expect(response.status).toBe(200);
     expect(json.cachedCount).toBe(1);
     expect(json.toTranslateCount).toBe(3);
