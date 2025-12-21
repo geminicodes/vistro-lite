@@ -104,7 +104,6 @@ export const upsertTranslationMemory = async (
     .from('translation_memory')
     .upsert(payload, {
       onConflict: 'site_id,segment_hash,target_lang',
-      returning: 'minimal',
     });
 
   if (error) {
