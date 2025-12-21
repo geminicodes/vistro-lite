@@ -186,7 +186,7 @@ describe('translation worker', () => {
         })),
         { onConflict: 'site_id,segment_hash,target_lang' },
       ),
-    ),
+    );
   });
 
     expect(db.translation_memory).toHaveLength(2);
