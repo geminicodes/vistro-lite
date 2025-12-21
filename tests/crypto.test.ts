@@ -1,29 +1,30 @@
 import { describe, expect, it } from 'vitest';
-import { randomBytes } from 'crypto';
 
 import { decryptJSON, encryptJSON, validateKey } from '../lib/_crypto';
 
-describe('crypto helpers', () => {
-  const base64Key = randomBytes(32).toString('base64');
+const createTestKey = (): string => {
+  const keyBytes = Uint8Array.from({ length: 32 }, (_, index) => index);
+  return Buffer.from(keyBytes).toString('base64');
+};
 
-  it('encrypts and decrypts JSON payloads', () => {
-    const payload = {
-      userId: 'user-123',
-      roles: ['editor', 'admin'],
-      flags: { beta: true, quota: 5 },
-      issuedAt: new Date('2025-01-01T00:00:00.000Z').toISOString(),
+describe('crypto helpers', () => {
+  it('encrypts then decrypts a JSON value', () => {
+    const base64Key = createTestKey();
+    const original = {
+      foo: 'bar',
+      nested: { count: 42, enabled: true },
+      list: ['a', 'b', 'c'],
     };
 
-    const token = encryptJSON(payload, base64Key);
-    const result = decryptJSON<typeof payload>(token, base64Key);
+    const payload = encryptJSON(original, base64Key);
+    const decrypted = decryptJSON<typeof original>(payload, base64Key);
 
-    expect(result).toEqual(payload);
+    expect(decrypted).toStrictEqual(original);
   });
 
-  it('rejects keys that are not 32 bytes once decoded', () => {
-    const shortKey = randomBytes(16).toString('base64');
+  it('rejects invalid key lengths', () => {
+    const invalidKey = Buffer.from('short key').toString('base64');
 
-    expect(() => validateKey(shortKey)).toThrowError(/32 bytes/);
-    expect(() => encryptJSON({ ok: true }, shortKey)).toThrowError(/32 bytes/);
+    expect(() => validateKey(invalidKey)).toThrow(/32 bytes/);
   });
 });

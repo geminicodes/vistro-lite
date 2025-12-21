@@ -1,162 +1,150 @@
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+'use server';
 
-// This module is intended for server-side usage only.
+/** @module _crypto */
 
-/**
- * Store your base64-encoded key (32 bytes) securely, for example in the `TOKEN_ENC_KEY`
- * environment variable.
- */
-// Generate with: openssl rand -base64 32
-// Or: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 const ALGORITHM = 'aes-256-gcm';
-const IV_LENGTH_BYTES = 12;
-const KEY_LENGTH_BYTES = 32;
-const AUTH_TAG_LENGTH_BYTES = 16;
-const BASE64_REGEX =
-  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{4})$/;
+const KEY_BYTE_LENGTH = 32;
+const IV_BYTE_LENGTH = 12;
+const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 
 /**
- * Ensure the supplied base64-encoded encryption key decodes to 32 bytes.
+ * TOKEN_ENC_KEY must be a base64 encoded 32-byte string.
  *
- * @remarks
- * Generate a key once and reuse it:
- * - `openssl rand -base64 32`
- * - `node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"`
- * Store the resulting value in an environment variable such as `TOKEN_ENC_KEY`.
- *
- * @param base64Key - Base64 string that must decode to 32 bytes.
- *
- * @throws {Error} If the key is missing, not valid base64, or not 32 bytes.
+ * Dev helpers to generate a key:
+ *   - openssl rand -base64 32
+ *   - node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
  */
-export function validateKey(base64Key: string): void {
-  decodeAndValidateKey(base64Key);
-}
 
-/**
- * Encrypt a JSON-serialisable value with AES-256-GCM.
- *
- * @example
- * ```ts
- * const key = process.env.TOKEN_ENC_KEY!;
- * const payload = { userId: '123' };
- * const encrypted = encryptJSON(payload, key);
- * const decrypted = decryptJSON<typeof payload>(encrypted, key);
- * ```
- *
- * @param obj - JSON-serialisable data.
- * @param base64Key - Base64 string that must decode to 32 bytes.
- *
- * @returns A single string containing base64-encoded IV, auth tag, and ciphertext separated by dots.
- *
- * @throws {Error} If serialization fails or encryption fails.
- */
-export function encryptJSON(obj: unknown, base64Key: string): string {
-  const key = decodeAndValidateKey(base64Key);
+function parseKey(base64Key: string): Buffer {
+  const normalizedKey = base64Key.replace(/\s+/g, '');
 
-  let plaintext: Buffer;
-  try {
-    const json = JSON.stringify(obj);
-    if (typeof json !== 'string') {
-      throw new Error();
-    }
-    plaintext = Buffer.from(json, 'utf8');
-  } catch {
-    throw new Error('Failed to serialise payload for encryption.');
+  if (!normalizedKey) {
+    throw new Error('Encryption key must be a non-empty base64 string.');
   }
 
-  const iv = randomBytes(IV_LENGTH_BYTES);
-  const cipher = createCipheriv(ALGORITHM, key, iv);
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const authTag = cipher.getAuthTag();
+  if (!BASE64_PATTERN.test(normalizedKey)) {
+    throw new Error('Encryption key must contain only base64 characters.');
+  }
 
-  return [iv, authTag, ciphertext].map((segment) => segment.toString('base64')).join('.');
+  const keyBuffer = Buffer.from(normalizedKey, 'base64');
+
+  if (keyBuffer.length !== KEY_BYTE_LENGTH) {
+    throw new Error(
+      `Encryption key must decode to ${KEY_BYTE_LENGTH} bytes. Received ${keyBuffer.length} bytes.`,
+    );
+  }
+
+  return keyBuffer;
 }
 
 /**
- * Decrypt a payload produced by {@link encryptJSON}.
+ * Ensures the provided base64-encoded key decodes to 32 bytes.
  *
  * @example
  * ```ts
- * const key = process.env.TOKEN_ENC_KEY!;
- * const token = encryptJSON({ sessionId: 'abc' }, key);
- * const session = decryptJSON<{ sessionId: string }>(token, key);
+ * validateKey(process.env.TOKEN_ENC_KEY ?? '');
  * ```
  *
- * @param payload - Dot-separated base64 segments `iv.tag.cipher`.
- * @param base64Key - Base64 string that must decode to 32 bytes.
+ * @throws {Error} When the key is empty, not valid base64, or not 32 bytes.
+ */
+export function validateKey(base64Key: string): void {
+  parseKey(base64Key);
+}
+
+/**
+ * Encrypts a JSON-serializable value with AES-256-GCM.
  *
- * @returns The parsed JSON value.
+ * The result is a string composed of three base64 segments: `iv.tag.cipher`.
  *
- * @throws {Error} If the payload is malformed, decryption fails, or parsing fails.
+ * @example
+ * ```ts
+ * const encrypted = encryptJSON(
+ *   { userId: '123', scope: ['read'] },
+ *   process.env.TOKEN_ENC_KEY ?? '',
+ * );
+ * ```
+ *
+ * @param obj - A JSON-serializable value.
+ * @param base64Key - Base64-encoded 32-byte encryption key.
+ * @returns The encrypted payload formatted as `iv.tag.cipher`.
+ *
+ * @throws {Error} When the key is invalid or the object cannot be serialized.
+ */
+export function encryptJSON(obj: unknown, base64Key: string): string {
+  const key = parseKey(base64Key);
+  let plaintext: string;
+
+  try {
+    plaintext = JSON.stringify(obj);
+  } catch (error) {
+    throw new Error('Failed to serialize object for encryption.');
+  }
+
+  const iv = randomBytes(IV_BYTE_LENGTH);
+  const cipher = createCipheriv(ALGORITHM, key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  const ivBase64 = iv.toString('base64');
+  const tagBase64 = authTag.toString('base64');
+  const cipherBase64 = ciphertext.toString('base64');
+
+  return `${ivBase64}.${tagBase64}.${cipherBase64}`;
+}
+
+/**
+ * Decrypts an `iv.tag.cipher` payload created by {@link encryptJSON}.
+ *
+ * @example
+ * ```ts
+ * const payload = decryptJSON<{ userId: string }>(
+ *   encryptedToken,
+ *   process.env.TOKEN_ENC_KEY ?? '',
+ * );
+ * ```
+ *
+ * @param payload - The encrypted string formatted as `iv.tag.cipher`.
+ * @param base64Key - Base64-encoded 32-byte encryption key.
+ *
+ * @returns The decrypted value, parsed from JSON.
+ *
+ * @throws {Error} When the key is invalid, payload is malformed, or decryption fails.
  */
 export function decryptJSON<T = unknown>(payload: string, base64Key: string): T {
-  const key = decodeAndValidateKey(base64Key);
+  const key = parseKey(base64Key);
   const segments = payload.split('.');
 
   if (segments.length !== 3) {
-    throw new Error('Encrypted payload must contain three segments: iv.tag.cipher.');
+    throw new Error('Encrypted payload must contain three base64 segments separated by ".".');
   }
 
-  const [ivSegment, tagSegment, cipherSegment] = segments;
-
-  let iv: Buffer;
-  let authTag: Buffer;
-  let ciphertext: Buffer;
+  const [ivBase64, tagBase64, cipherBase64] = segments;
 
   try {
-    iv = Buffer.from(ivSegment, 'base64');
-    authTag = Buffer.from(tagSegment, 'base64');
-    ciphertext = Buffer.from(cipherSegment, 'base64');
-  } catch {
-    throw new Error('Encrypted payload contains invalid base64 segments.');
+    const iv = Buffer.from(ivBase64, 'base64');
+    const authTag = Buffer.from(tagBase64, 'base64');
+    const ciphertext = Buffer.from(cipherBase64, 'base64');
+
+    if (iv.length !== IV_BYTE_LENGTH) {
+      throw new Error(`Initialization vector must be ${IV_BYTE_LENGTH} bytes.`);
+    }
+
+    const decipher = createDecipheriv(ALGORITHM, key, iv);
+    decipher.setAuthTag(authTag);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+
+    return JSON.parse(decrypted.toString('utf8')) as T;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      throw new Error('Failed to parse decrypted payload as JSON.');
+    }
+
+    if (error instanceof Error) {
+      throw new Error(`Failed to decrypt payload: ${error.message}`);
+    }
+
+    throw new Error('Failed to decrypt payload due to an unknown error.');
   }
-
-  if (iv.length !== IV_LENGTH_BYTES) {
-    throw new Error(`Initialisation vector must be ${IV_LENGTH_BYTES} bytes.`);
-  }
-
-  if (authTag.length !== AUTH_TAG_LENGTH_BYTES) {
-    throw new Error(`Authentication tag must be ${AUTH_TAG_LENGTH_BYTES} bytes.`);
-  }
-
-  if (ciphertext.length === 0) {
-    throw new Error('Ciphertext segment is empty or invalid.');
-  }
-
-  const decipher = createDecipheriv(ALGORITHM, key, iv);
-  decipher.setAuthTag(authTag);
-
-  let plaintext: Buffer;
-  try {
-    plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
-  } catch {
-    throw new Error('Failed to decrypt payload: authentication failed or data is corrupted.');
-  }
-
-  try {
-    return JSON.parse(plaintext.toString('utf8')) as T;
-  } catch {
-    throw new Error('Failed to parse decrypted payload as JSON.');
-  }
-}
-
-function decodeAndValidateKey(base64Key: string): Buffer {
-  const sanitized = base64Key.replace(/\s+/g, '');
-
-  if (!sanitized) {
-    throw new Error('Encryption key is required.');
-  }
-
-  if (!BASE64_REGEX.test(sanitized)) {
-    throw new Error('Encryption key must be a valid base64 string.');
-  }
-
-  const key = Buffer.from(sanitized, 'base64');
-
-  if (key.length !== KEY_LENGTH_BYTES) {
-    throw new Error(`Encryption key must decode to ${KEY_LENGTH_BYTES} bytes (received ${key.length}).`);
-  }
-
-  return key;
 }
