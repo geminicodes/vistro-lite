@@ -2,11 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { processTranslationJob } from '../lib/translationWorker';
 
-type TableName =
-  | 'translation_jobs'
-  | 'translation_segments'
-  | 'translation_memory'
-  | 'job_queue';
+type TableName = 'translation_jobs' | 'translation_segments' | 'translation_memory' | 'job_queue';
 
 interface MockDb {
   translation_jobs: any[];
@@ -28,10 +24,20 @@ const {
   mockInfo: vi.fn(),
   mockWarn: vi.fn(),
 }));
- 
+
 vi.mock('../lib/supabaseServer', () => ({
   createSupabaseServiceClient: mockCreateSupabaseServiceClient,
   upsertTranslationMemory: mockUpsertTranslationMemory,
+}));
+
+vi.mock('../lib/deeplClient', () => ({
+  translateBatch: mockTranslateBatch,
+}));
+
+vi.mock('../lib/log', () => ({
+  info: mockInfo,
+  warn: mockWarn,
+  error: vi.fn(),
 }));
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
@@ -54,20 +60,13 @@ const createMockSupabaseClient = (db: MockDb) => ({
               const filtered = filters.reduce((result, filter) => result.filter(filter), rows);
               const projected = filtered.map((row) => {
                 const projection: Record<string, any> = {};
-
-                for (const field of fields) {
-                  projection[field] = row[field];
-                }
-
+                for (const field of fields) projection[field] = row[field];
                 return projection;
               });
 
               return Promise.resolve({ data: projected, error: null }).then(onFulfilled, onRejected);
             } catch (error) {
-              if (onRejected) {
-                return Promise.reject(error).catch(onRejected);
-              }
-
+              if (onRejected) return Promise.reject(error).catch(onRejected);
               return Promise.reject(error);
             }
           },
@@ -94,11 +93,8 @@ const createMockSupabaseClient = (db: MockDb) => ({
             conflictKeys.every((key) => existing[key] === row[key]),
           );
 
-          if (index >= 0) {
-            db[table][index] = { ...db[table][index], ...clone(row) };
-          } else {
-            db[table].push(clone(row));
-          }
+          if (index >= 0) db[table][index] = { ...db[table][index], ...clone(row) };
+          else db[table].push(clone(row));
         }
 
         return Promise.resolve({ data: rows, error: null });
@@ -106,9 +102,7 @@ const createMockSupabaseClient = (db: MockDb) => ({
       update(updateValue: Record<string, unknown>) {
         return {
           eq(field: string, value: unknown) {
-            db[table] = db[table].map((row) =>
-              row[field] === value ? { ...row, ...clone(updateValue) } : row,
-            );
+            db[table] = db[table].map((row) => (row[field] === value ? { ...row, ...clone(updateValue) } : row));
             return Promise.resolve({ data: null, error: null });
           },
         };
@@ -123,13 +117,7 @@ describe('translation worker', () => {
 
   beforeEach(() => {
     db = {
-      translation_jobs: [
-        {
-          id: jobId,
-          site_id: 'site-001',
-          status: 'pending',
-        },
-      ],
+      translation_jobs: [{ id: jobId, site_id: 'site-001', status: 'pending' }],
       translation_segments: [
         {
           id: 'seg-1',
@@ -151,29 +139,13 @@ describe('translation worker', () => {
         },
       ],
       translation_memory: [],
-      job_queue: [
-        {
-          id: 1,
-          job_id: jobId,
-          processed: false,
-        },
-      ],
+      job_queue: [{ id: 1, job_id: jobId, processed: false }],
     };
 
     mockTranslateBatch.mockImplementation((texts: string[], targetLang: string) =>
       texts.map((text) => `${text} [${targetLang}]`),
     );
 
-    mockUpsertTranslationMemory.mockImplementation((_entries: any[], client: any) =>
-      client.from('translation_memory').upsert(_entries, {
-        onConflict: 'site_id,segment_hash,target_lang',
-      }),
-    );
-
-    mockCreateSupabaseServiceClient.mockReturnValue(createMockSupabaseClient(db));
-  });
-
-  afterEach(() => {
     mockUpsertTranslationMemory.mockImplementation((entries: any[], client: any) =>
       client.from('translation_memory').upsert(
         entries.map((entry) => ({
@@ -187,7 +159,25 @@ describe('translation worker', () => {
         { onConflict: 'site_id,segment_hash,target_lang' },
       ),
     );
+
+    mockCreateSupabaseServiceClient.mockReturnValue(createMockSupabaseClient(db));
   });
+
+  afterEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('translates pending segments and updates metadata', async () => {
+    await processTranslationJob(jobId);
+
+    expect(mockTranslateBatch).toHaveBeenCalledTimes(2);
+
+    expect(db.translation_segments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'seg-1', translated_text: 'Hello world [es]' }),
+        expect.objectContaining({ id: 'seg-2', translated_text: 'Second phrase [fr]' }),
+      ]),
+    );
 
     expect(db.translation_memory).toHaveLength(2);
     expect(db.translation_memory).toEqual(
