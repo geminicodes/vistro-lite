@@ -41,13 +41,13 @@ const subscriptionCreatedSchema = z.object({
       renews_at: z.union([z.string(), z.null()]).optional(),
     }),
   }),
-});
+}),
 
 const eventIdSchema = z.object({
   data: z.object({
     id: z.string(),
   }),
-});
+}),
 
 const toInteger = (value: number | string | null | undefined): number => {
   if (value == null) {
@@ -62,7 +62,7 @@ const toInteger = (value: number | string | null | undefined): number => {
   }
 
   return parsed;
-};
+},
 
 const safeCompare = (computed: string, received: string): boolean => {
   const computedBuffer = Buffer.from(computed, 'utf8');
@@ -73,12 +73,12 @@ const safeCompare = (computed: string, received: string): boolean => {
   }
 
   return timingSafeEqual(computedBuffer, receivedBuffer);
-};
+},
 
 const verifySignature = (payload: string, signature: string, secret: string): boolean => {
   const digest = createHmac('sha256', secret).update(payload, 'utf8').digest('hex');
   return safeCompare(digest, signature);
-};
+},
 
 const recordAffiliateConversion = async (
   supabase: ReturnType<typeof createSupabaseServiceClient>,
@@ -111,7 +111,7 @@ const recordAffiliateConversion = async (
       error instanceof Error ? error.message : error,
     );
   }
-};
+},
 
 const persistWebhookEvent = async (
   supabase: ReturnType<typeof createSupabaseServiceClient>,
@@ -152,7 +152,7 @@ const persistWebhookEvent = async (
       },
       { onConflict: 'lemon_event_id' },
     );
-};
+},
 
 const handleOrderCreated = async (
   supabase: ReturnType<typeof createSupabaseServiceClient>,
@@ -183,7 +183,7 @@ const handleOrderCreated = async (
     meta?.custom_data as Record<string, unknown> | undefined,
     id,
   );
-};
+},
 
 const handleOrderRefunded = async (
   supabase: ReturnType<typeof createSupabaseServiceClient>,
@@ -200,7 +200,7 @@ const handleOrderRefunded = async (
   if (error) {
     throw new Error(`Failed to update refunded order: ${error.message}`);
   }
-};
+},
 
 const handleSubscriptionCreated = async (
   supabase: ReturnType<typeof createSupabaseServiceClient>,
@@ -224,7 +224,7 @@ const handleSubscriptionCreated = async (
   if (error) {
     throw new Error(`Failed to upsert subscription: ${error.message}`);
   }
-};
+},
 
 const handleSubscriptionCanceled = async (
   supabase: ReturnType<typeof createSupabaseServiceClient>,
@@ -241,7 +241,7 @@ const handleSubscriptionCanceled = async (
   if (error) {
     throw new Error(`Failed to cancel subscription: ${error.message}`);
   }
-};
+},
 
 export async function POST(request: Request): Promise<Response> {
   const secret = process.env.LEMONSQUEEZY_WEBHOOK_SECRET;
