@@ -28,12 +28,9 @@ const orderCreatedSchema = z.object({
       .object({
         custom_data: z
           .record(z.any())
-          .optional()
-          .default(undefined),
+          .optional(),
       })
       .optional(),
-  }),
-});
 
 const subscriptionCreatedSchema = z.object({
   data: z.object({
@@ -153,7 +150,7 @@ const persistWebhookEvent = async (
         lemon_event_id: eventId,
         payload: sanitizedPayload,
       },
-      { onConflict: 'lemon_event_id', returning: 'minimal' },
+      { onConflict: 'lemon_event_id' },
     );
 };
 
@@ -174,7 +171,7 @@ const handleOrderCreated = async (
         status,
         total_cents: totalCents,
       },
-      { onConflict: 'lemon_order_id', returning: 'minimal' },
+      { onConflict: 'lemon_order_id' },
     );
 
   if (error) {
@@ -221,7 +218,7 @@ const handleSubscriptionCreated = async (
         plan_name: attributes.plan_name ?? null,
         renews_at: attributes.renews_at ?? null,
       },
-      { onConflict: 'lemon_subscription_id', returning: 'minimal' },
+      { onConflict: 'lemon_subscription_id' },
     );
 
   if (error) {
