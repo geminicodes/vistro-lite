@@ -13,13 +13,13 @@ interface MockDb {
   affiliate_conversions: any[];
 }
 
-const mockCreateSupabaseServiceClient = vi.fn();
-
+const { mockCreateSupabaseServiceClient } = vi.hoisted(() => ({
+  mockCreateSupabaseServiceClient: vi.fn(),
+}));
+ 
 vi.mock('../lib/supabaseServer', () => ({
   createSupabaseServiceClient: mockCreateSupabaseServiceClient,
 }));
-
-const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 
 const createMockSupabaseClient = (db: MockDb) => ({
   from(table: TableName) {
@@ -124,7 +124,7 @@ describe('Lemon Squeezy webhook route', () => {
     };
 
     const response = await POST(createRequest(payload));
-    const json = await response.json();
+    const json = (await response.json()) as any;
 
     expect(response.status).toBe(200);
     expect(json.received).toBe(true);
