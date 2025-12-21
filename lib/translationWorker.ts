@@ -21,36 +21,29 @@ interface TranslationSegmentRow {
   job_id: string;
   source_lang: string | null;
   target_lang: string;
-
-const parseIntegerEnv = (value: string | undefined, fallback: number): number => {
-  if (!value) {
-    return fallback;
-  }
-
-  const parsed = Number.parseInt(value, 10);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
-};
-
-const WORKER_RETRIES = parseIntegerEnv(process.env.WORKER_TRANSLATE_RETRIES, 3);
-const WORKER_MIN_DELAY_MS = parseIntegerEnv(process.env.WORKER_TRANSLATE_MIN_MS, 500);
-const WORKER_MAX_DELAY_MS = parseIntegerEnv(process.env.WORKER_TRANSLATE_MAX_MS, 5_000);
   segment_hash: string;
   source_text: string;
   translated_text: string | null;
 }
-
+ 
+const parseIntegerEnv = (value: string | undefined, fallback: number): number => {
+  if (!value) {
+    return fallback;
+  }
+ 
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+ 
+const WORKER_RETRIES = parseIntegerEnv(process.env.WORKER_TRANSLATE_RETRIES, 3);
+const WORKER_MIN_DELAY_MS = parseIntegerEnv(process.env.WORKER_TRANSLATE_MIN_MS, 500);
+const WORKER_MAX_DELAY_MS = parseIntegerEnv(process.env.WORKER_TRANSLATE_MAX_MS, 5_000);
+ 
 const groupSegmentsByTarget = (
   segments: TranslationSegmentRow[],
 ): Map<string, TranslationSegmentRow[]> => {
   const groups = new Map<string, TranslationSegmentRow[]>();
-
-  for (const segment of segments) {
-    const list = groups.get(segment.target_lang) ?? [];
-    list.push(segment);
-    groups.set(segment.target_lang, list);
-  }
-
-  return groups;
+  // ...
 };
 
 const markJobCompleted = async (client: AnySupabaseClient, jobId: string): Promise<void> => {
@@ -159,8 +152,8 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
   if (updates.length > 0) {
     const { error: updateError } = await supabase
       .from('translation_segments')
-      .upsert(updates, { onConflict: 'id', returning: 'minimal' });
-
+      .upsert(updates, { onConflict: 'id' });
+ 
     if (updateError) {
       throw new Error(`Failed to update translation segments: ${updateError.message}`);
     }
