@@ -26,9 +26,11 @@ const WORKER_ID = process.env.WORKER_ID || `${os.hostname()}-${process.pid}-${ra
 const WORKER_LEASE_SECONDS = parseIntegerEnv(process.env.WORKER_LEASE_SECONDS, 300);
 const WORKER_MAX_JOB_ATTEMPTS = parseIntegerEnv(process.env.WORKER_MAX_JOB_ATTEMPTS, 5);
 const WORKER_IDLE_POLL_MS = parseIntegerEnv(process.env.WORKER_IDLE_POLL_MS, 2_000);
+const WORKER_CONCURRENCY = parseIntegerEnv(process.env.WORKER_CONCURRENCY, 1);
+const WORKER_HEARTBEAT_MS = parseIntegerEnv(process.env.WORKER_HEARTBEAT_MS, 60_000);
 
 let shouldStop = false;
-let inFlightLock = null; // { jobId, lockToken }
+const inFlight = new Map(); // jobId -> { lockToken, promise }
 
 process.on('SIGINT', () => {
   shouldStop = true;
@@ -111,6 +113,13 @@ const releaseJob = async (client, jobId, lockToken, err) => {
 
 const main = async () => {
   const client = createSupabaseServiceClient();
+  const heartbeat = setInterval(() => {
+    info('Worker heartbeat', {
+      workerId: WORKER_ID,
+      inFlight: inFlight.size,
+      shouldStop,
+    });
+  }, WORKER_HEARTBEAT_MS).unref?.();
 
   if (cliJobId) {
     const claimed = await claimSpecificJob(client, cliJobId);
@@ -120,7 +129,7 @@ const main = async () => {
     }
 
     const { job_id: jobId, lock_token: lockToken, attempts } = claimed;
-    inFlightLock = { jobId, lockToken };
+    inFlight.set(jobId, { lockToken, promise: Promise.resolve() });
     info('Running translation worker for specific job', { jobId, attempts, workerId: WORKER_ID });
 
     try {
@@ -140,69 +149,87 @@ const main = async () => {
       }
       throw err;
     } finally {
-      inFlightLock = null;
+      inFlight.delete(jobId);
+      clearInterval(heartbeat);
     }
     return;
   }
 
-  while (!shouldStop) {
-    const claimed = await claimNextJob(client);
+  const startJob = async (claimed) => {
+    const { job_id: jobId, lock_token: lockToken, attempts } = claimed;
+    info('Processing queued translation job', { jobId, attempts, workerId: WORKER_ID });
 
+    const promise = (async () => {
+      try {
+        if (attempts > WORKER_MAX_JOB_ATTEMPTS) {
+          warn('Job exceeded max attempts; marking failed', { jobId, attempts });
+          await failJobPermanently(client, jobId, lockToken, new Error('Exceeded maximum attempts.'));
+          return;
+        }
+
+        await processTranslationJob(jobId);
+        await completeJob(client, jobId, lockToken);
+      } catch (err) {
+        if (attempts >= WORKER_MAX_JOB_ATTEMPTS) {
+          await failJobPermanently(client, jobId, lockToken, err);
+        } else {
+          await releaseJob(client, jobId, lockToken, err);
+        }
+
+        warn('Translation job failed', {
+          jobId,
+          attempts,
+          workerId: WORKER_ID,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        inFlight.delete(jobId);
+      }
+    })();
+
+    inFlight.set(jobId, { lockToken, promise });
+    return promise;
+  };
+
+  while (!shouldStop) {
+    if (inFlight.size >= WORKER_CONCURRENCY) {
+      await Promise.race(Array.from(inFlight.values()).map((entry) => entry.promise));
+      continue;
+    }
+
+    const claimed = await claimNextJob(client);
     if (!claimed) {
       if (runOnce) {
         info('No pending translation jobs found');
         break;
       }
-
       await new Promise((resolve) => setTimeout(resolve, WORKER_IDLE_POLL_MS));
       continue;
     }
 
-    const { job_id: jobId, lock_token: lockToken, attempts } = claimed;
-    inFlightLock = { jobId, lockToken };
-    info('Processing queued translation job', { jobId, attempts, workerId: WORKER_ID });
-
-    try {
-      if (attempts > WORKER_MAX_JOB_ATTEMPTS) {
-        warn('Job exceeded max attempts; marking failed', { jobId, attempts });
-        await failJobPermanently(client, jobId, lockToken, new Error('Exceeded maximum attempts.'));
-        continue;
-      }
-
-      await processTranslationJob(jobId);
-      await completeJob(client, jobId, lockToken);
-    } catch (err) {
-      if (attempts >= WORKER_MAX_JOB_ATTEMPTS) {
-        await failJobPermanently(client, jobId, lockToken, err);
-      } else {
-        await releaseJob(client, jobId, lockToken, err);
-      }
-
-      warn('Translation job failed', {
-        jobId,
-        attempts,
-        workerId: WORKER_ID,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    } finally {
-      inFlightLock = null;
-    }
+    void startJob(claimed);
 
     if (runOnce) {
       break;
     }
   }
 
-  if (shouldStop && inFlightLock) {
-    try {
-      await releaseJob(client, inFlightLock.jobId, inFlightLock.lockToken, new Error('Worker shutdown.'));
-    } catch (err) {
-      warn('Failed releasing in-flight job on shutdown', {
-        jobId: inFlightLock.jobId,
-        error: err instanceof Error ? err.message : String(err),
-      });
+  // Graceful shutdown: wait for in-flight jobs to finish, then release any locks if still present.
+  if (shouldStop) {
+    await Promise.allSettled(Array.from(inFlight.values()).map((entry) => entry.promise));
+    for (const [jobId, entry] of inFlight.entries()) {
+      try {
+        await releaseJob(client, jobId, entry.lockToken, new Error('Worker shutdown.'));
+      } catch (err) {
+        warn('Failed releasing in-flight job on shutdown', {
+          jobId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
+
+  clearInterval(heartbeat);
 };
 
 main()

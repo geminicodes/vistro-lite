@@ -131,6 +131,8 @@ create table if not exists public.translation_jobs (
   completed_at timestamptz null,
   failed_at timestamptz null,
   last_error text null,
+  requested_segments integer null,
+  translated_segments integer not null default 0,
   unique (site_id, idempotency_key),
   constraint translation_jobs_status_check check (status in ('pending', 'processing', 'completed', 'failed'))
 );
@@ -379,10 +381,13 @@ begin
     raise exception 'p_segments must be a JSON array';
   end if;
 
-  insert into public.translation_jobs (site_id, source_url, idempotency_key, status)
-  values (p_site_id, p_source_url, nullif(p_idempotency_key, ''), 'pending')
+  insert into public.translation_jobs (site_id, source_url, idempotency_key, status, requested_segments, translated_segments)
+  values (p_site_id, p_source_url, nullif(p_idempotency_key, ''), 'pending', jsonb_array_length(p_segments), 0)
   on conflict (site_id, idempotency_key)
-  do update set source_url = excluded.source_url
+  do update set
+    source_url = excluded.source_url,
+    requested_segments = excluded.requested_segments,
+    translated_segments = 0
   returning id into v_job_id;
 
   insert into public.translation_segments (job_id, source_lang, target_lang, segment_hash, source_text)
@@ -426,7 +431,6 @@ begin
     raise exception 'p_lease_seconds must be > 0';
   end if;
 
-  return query
   with claimed as (
     update public.job_queue jq
     set
@@ -446,6 +450,13 @@ begin
     )
     returning jq.job_id, jq.lock_token, jq.attempts
   )
+  update public.translation_jobs tj
+  set status = 'processing',
+      started_at = coalesce(tj.started_at, now()),
+      last_error = null
+  where tj.id in (select job_id from claimed);
+
+  return query
   select claimed.job_id, claimed.lock_token, claimed.attempts from claimed;
 end;
 $$;
@@ -468,7 +479,6 @@ begin
     raise exception 'p_lease_seconds must be > 0';
   end if;
 
-  return query
   with claimed as (
     update public.job_queue jq
     set
@@ -482,6 +492,13 @@ begin
       and (jq.lease_expires_at is null or jq.lease_expires_at < now())
     returning jq.job_id, jq.lock_token, jq.attempts
   )
+  update public.translation_jobs tj
+  set status = 'processing',
+      started_at = coalesce(tj.started_at, now()),
+      last_error = null
+  where tj.id in (select job_id from claimed);
+
+  return query
   select claimed.job_id, claimed.lock_token, claimed.attempts from claimed;
 end;
 $$;
@@ -514,7 +531,7 @@ begin
 
   update public.translation_jobs
   set
-    status = case when status = 'processing' then 'pending' else status end,
+    status = 'pending',
     last_error = left(coalesce(p_error, ''), 2000)
   where id = p_job_id;
 
