@@ -124,9 +124,15 @@ create table if not exists public.translation_jobs (
   id uuid primary key default gen_random_uuid(),
   site_id uuid not null references public.sites (id) on delete cascade,
   source_url text,
+  idempotency_key text,
   status text not null default 'pending',
   created_at timestamptz not null default now(),
-  completed_at timestamptz null
+  started_at timestamptz null,
+  completed_at timestamptz null,
+  failed_at timestamptz null,
+  last_error text null,
+  unique (site_id, idempotency_key),
+  constraint translation_jobs_status_check check (status in ('pending', 'processing', 'completed', 'failed'))
 );
 
 create index if not exists translation_jobs_site_id_idx on public.translation_jobs (site_id);
@@ -155,11 +161,12 @@ create table if not exists public.translation_segments (
   id uuid primary key default gen_random_uuid(),
   job_id uuid not null references public.translation_jobs (id) on delete cascade,
   source_lang text,
-  target_lang text,
-  segment_hash text,
-  source_text text,
+  target_lang text not null,
+  segment_hash text not null,
+  source_text text not null,
   translated_text text null,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  unique (job_id, segment_hash, target_lang)
 );
 
 create index if not exists translation_segments_job_id_idx on public.translation_segments (job_id);
@@ -221,12 +228,21 @@ create policy "Service role manages translation memory" on public.translation_me
 -- 7. job_queue --------------------------------------------------------------
 create table if not exists public.job_queue (
   id serial primary key,
-  job_id uuid references public.translation_jobs (id) on delete cascade,
+  job_id uuid not null references public.translation_jobs (id) on delete cascade,
   enqueued_at timestamptz not null default now(),
-  processed boolean not null default false
+  processed boolean not null default false,
+  processed_at timestamptz null,
+  attempts integer not null default 0,
+  locked_at timestamptz null,
+  locked_by text null,
+  lease_expires_at timestamptz null,
+  lock_token uuid null,
+  last_error text null,
+  unique (job_id)
 );
 
 create index if not exists job_queue_processed_idx on public.job_queue (processed);
+create index if not exists job_queue_lease_idx on public.job_queue (lease_expires_at);
 
 alter table public.job_queue enable row level security;
 
@@ -303,6 +319,7 @@ create policy "Service role manages subscriptions" on public.subscriptions
 create table if not exists public.webhook_events (
   id uuid primary key default gen_random_uuid(),
   lemon_event_id text unique,
+  event_name text,
   payload jsonb,
   received_at timestamptz not null default now()
 );
@@ -322,3 +339,241 @@ create policy "Service role manages webhook events" on public.webhook_events
 --   - allow authenticated users to insert their own bookings
 --   - allow site owners to select bookings tied to their site_id
 -- See https://supabase.com/docs/guides/auth/row-level-security for examples.
+
+-- 9. Affiliate conversions (optional but referenced by webhook route) -------
+create table if not exists public.affiliate_conversions (
+  id uuid primary key default gen_random_uuid(),
+  site_id uuid references public.sites (id) on delete cascade,
+  affiliate_code text,
+  lemon_order_id text not null unique,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists affiliate_conversions_site_id_idx on public.affiliate_conversions (site_id);
+
+alter table public.affiliate_conversions enable row level security;
+
+create policy "Service role manages affiliate conversions" on public.affiliate_conversions
+  for all
+  to service_role
+  using (true)
+  with check (true);
+
+-- 10. Queue & worker RPC helpers --------------------------------------------
+
+create or replace function public.enqueue_translation_job(
+  p_site_id uuid,
+  p_source_url text,
+  p_idempotency_key text,
+  p_segments jsonb
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_job_id uuid;
+begin
+  if jsonb_typeof(p_segments) is distinct from 'array' then
+    raise exception 'p_segments must be a JSON array';
+  end if;
+
+  insert into public.translation_jobs (site_id, source_url, idempotency_key, status)
+  values (p_site_id, p_source_url, nullif(p_idempotency_key, ''), 'pending')
+  on conflict (site_id, idempotency_key)
+  do update set source_url = excluded.source_url
+  returning id into v_job_id;
+
+  insert into public.translation_segments (job_id, source_lang, target_lang, segment_hash, source_text)
+  select
+    v_job_id,
+    coalesce((seg->>'source_lang')::text, 'auto'),
+    (seg->>'target_lang')::text,
+    (seg->>'segment_hash')::text,
+    (seg->>'source_text')::text
+  from jsonb_array_elements(p_segments) as seg
+  on conflict (job_id, segment_hash, target_lang) do nothing;
+
+  insert into public.job_queue (job_id, processed, enqueued_at)
+  values (v_job_id, false, now())
+  on conflict (job_id)
+  do update set
+    processed = false,
+    processed_at = null,
+    enqueued_at = excluded.enqueued_at,
+    locked_at = null,
+    locked_by = null,
+    lease_expires_at = null,
+    lock_token = null,
+    last_error = null;
+
+  return v_job_id;
+end;
+$$;
+
+create or replace function public.claim_next_translation_job(
+  p_worker_id text,
+  p_lease_seconds integer
+)
+returns table(job_id uuid, lock_token uuid, attempts integer)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if p_lease_seconds is null or p_lease_seconds <= 0 then
+    raise exception 'p_lease_seconds must be > 0';
+  end if;
+
+  return query
+  with claimed as (
+    update public.job_queue jq
+    set
+      locked_at = now(),
+      locked_by = p_worker_id,
+      lease_expires_at = now() + make_interval(secs => p_lease_seconds),
+      lock_token = gen_random_uuid(),
+      attempts = jq.attempts + 1
+    where jq.id = (
+      select id
+      from public.job_queue
+      where processed = false
+        and (lease_expires_at is null or lease_expires_at < now())
+      order by enqueued_at asc
+      for update skip locked
+      limit 1
+    )
+    returning jq.job_id, jq.lock_token, jq.attempts
+  )
+  select claimed.job_id, claimed.lock_token, claimed.attempts from claimed;
+end;
+$$;
+
+create or replace function public.claim_translation_job(
+  p_job_id uuid,
+  p_worker_id text,
+  p_lease_seconds integer
+)
+returns table(job_id uuid, lock_token uuid, attempts integer)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if p_job_id is null then
+    raise exception 'p_job_id is required';
+  end if;
+  if p_lease_seconds is null or p_lease_seconds <= 0 then
+    raise exception 'p_lease_seconds must be > 0';
+  end if;
+
+  return query
+  with claimed as (
+    update public.job_queue jq
+    set
+      locked_at = now(),
+      locked_by = p_worker_id,
+      lease_expires_at = now() + make_interval(secs => p_lease_seconds),
+      lock_token = gen_random_uuid(),
+      attempts = jq.attempts + 1
+    where jq.job_id = p_job_id
+      and jq.processed = false
+      and (jq.lease_expires_at is null or jq.lease_expires_at < now())
+    returning jq.job_id, jq.lock_token, jq.attempts
+  )
+  select claimed.job_id, claimed.lock_token, claimed.attempts from claimed;
+end;
+$$;
+
+create or replace function public.release_translation_job(
+  p_job_id uuid,
+  p_lock_token uuid,
+  p_error text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  updated_count integer;
+begin
+  update public.job_queue
+  set
+    locked_at = null,
+    locked_by = null,
+    lease_expires_at = now() - interval '1 second',
+    lock_token = null,
+    last_error = left(coalesce(p_error, ''), 2000)
+  where job_id = p_job_id
+    and lock_token = p_lock_token
+    and processed = false;
+
+  get diagnostics updated_count = row_count;
+
+  update public.translation_jobs
+  set
+    status = case when status = 'processing' then 'pending' else status end,
+    last_error = left(coalesce(p_error, ''), 2000)
+  where id = p_job_id;
+
+  return updated_count = 1;
+end;
+$$;
+
+create or replace function public.complete_translation_job(
+  p_job_id uuid,
+  p_lock_token uuid,
+  p_success boolean,
+  p_error text
+)
+returns boolean
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  updated_count integer;
+begin
+  update public.job_queue
+  set
+    processed = true,
+    processed_at = now(),
+    locked_at = null,
+    locked_by = null,
+    lease_expires_at = null,
+    lock_token = null,
+    last_error = left(coalesce(p_error, ''), 2000)
+  where job_id = p_job_id
+    and lock_token = p_lock_token
+    and processed = false;
+
+  get diagnostics updated_count = row_count;
+
+  if p_success then
+    update public.translation_jobs
+    set
+      status = 'completed',
+      completed_at = now(),
+      failed_at = null,
+      last_error = null
+    where id = p_job_id;
+  else
+    update public.translation_jobs
+    set
+      status = 'failed',
+      failed_at = now(),
+      last_error = left(coalesce(p_error, ''), 2000)
+    where id = p_job_id;
+  end if;
+
+  return updated_count = 1;
+end;
+$$;
+
+grant execute on function public.enqueue_translation_job(uuid, text, text, jsonb) to service_role;
+grant execute on function public.claim_next_translation_job(text, integer) to service_role;
+grant execute on function public.claim_translation_job(uuid, text, integer) to service_role;
+grant execute on function public.release_translation_job(uuid, uuid, text) to service_role;
+grant execute on function public.complete_translation_job(uuid, uuid, boolean, text) to service_role;

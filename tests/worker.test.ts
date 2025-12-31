@@ -167,7 +167,7 @@ describe('translation worker', () => {
     vi.resetAllMocks();
   });
 
-  it('translates pending segments and updates metadata', async () => {
+  it('translates pending segments and persists results', async () => {
     await processTranslationJob(jobId);
 
     expect(mockTranslateBatch).toHaveBeenCalledTimes(2);
@@ -187,7 +187,7 @@ describe('translation worker', () => {
       ]),
     );
 
-    expect(db.translation_jobs[0]).toMatchObject({ status: 'completed' });
-    expect(db.job_queue[0]).toMatchObject({ processed: true });
+    expect(db.translation_jobs[0]).toMatchObject({ status: 'pending' });
+    expect(db.job_queue[0]).toMatchObject({ processed: false });
   });
 });

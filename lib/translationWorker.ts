@@ -5,7 +5,6 @@ import { info, warn } from './log';
 import { retryWithBackoff } from './retry';
 import {
   createSupabaseServiceClient,
-  type AnySupabaseClient,
   type TranslationMemoryEntry,
   upsertTranslationMemory,
 } from './supabaseServer';
@@ -43,18 +42,18 @@ const groupSegmentsByTarget = (
   segments: TranslationSegmentRow[],
 ): Map<string, TranslationSegmentRow[]> => {
   const groups = new Map<string, TranslationSegmentRow[]>();
-  // ...
-};
 
-const markJobCompleted = async (client: AnySupabaseClient, jobId: string): Promise<void> => {
-  const completedAt = new Date().toISOString();
+  for (const segment of segments) {
+    const key = segment.target_lang;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.push(segment);
+    } else {
+      groups.set(key, [segment]);
+    }
+  }
 
-  await client
-    .from('translation_jobs')
-    .update({ status: 'completed', completed_at: completedAt })
-    .eq('id', jobId);
-
-  await client.from('job_queue').update({ processed: true }).eq('job_id', jobId);
+  return groups;
 };
 
 export const processTranslationJob = async (jobId: string): Promise<void> => {
@@ -91,20 +90,16 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
   const segmentRows = (segments as TranslationSegmentRow[] | null) ?? [];
 
   if (segmentRows.length === 0) {
-    await markJobCompleted(supabase, jobId);
     return;
   }
 
   const pendingSegments = segmentRows.filter((segment) => !segment.translated_text);
 
   if (pendingSegments.length === 0) {
-    await markJobCompleted(supabase, jobId);
     return;
   }
 
   const groupedSegments = groupSegmentsByTarget(pendingSegments);
-  const updates: Array<{ id: string; job_id: string; translated_text: string }> = [];
-  const memoryEntries: TranslationMemoryEntry[] = [];
 
   info('Worker processing translation job', { jobId, groups: groupedSegments.size });
 
@@ -131,14 +126,12 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
       throw new Error('DeepL translation response length mismatch.');
     }
 
+    const updates: Array<{ id: string; job_id: string; translated_text: string }> = [];
+    const memoryEntries: TranslationMemoryEntry[] = [];
+
     translations.forEach((translatedText, index) => {
       const segment = group[index];
-      updates.push({
-        id: segment.id,
-        job_id: segment.job_id,
-        translated_text: translatedText,
-      });
-
+      updates.push({ id: segment.id, job_id: segment.job_id, translated_text: translatedText });
       memoryEntries.push({
         siteId: job.site_id,
         sourceLang: segment.source_lang ?? 'auto',
@@ -147,22 +140,17 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
         translatedText,
       });
     });
-  }
 
-  if (updates.length > 0) {
     const { error: updateError } = await supabase
       .from('translation_segments')
       .upsert(updates, { onConflict: 'id' });
- 
+
     if (updateError) {
       throw new Error(`Failed to update translation segments: ${updateError.message}`);
     }
-  }
 
-  if (memoryEntries.length > 0) {
     await upsertTranslationMemory(memoryEntries, supabase);
   }
 
-  await markJobCompleted(supabase, jobId);
-  info('Worker completed translation job', { jobId });
+  info('Worker finished translating job segments', { jobId });
 };
