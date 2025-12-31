@@ -45,7 +45,7 @@ const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 const createMockSupabaseClient = (db: MockDb) => ({
   from(table: TableName) {
     return {
-      select(columns: string) {
+      select(columns: string, options?: { count?: 'exact'; head?: boolean }) {
         const fields = columns.split(',').map((field) => field.trim());
         let rows = db[table].map((row) => clone(row));
         const filters: Array<(row: any) => boolean> = [];
@@ -55,16 +55,33 @@ const createMockSupabaseClient = (db: MockDb) => ({
             filters.push((row) => row[field] === value);
             return builder;
           },
+          in(field: string, values: any[]) {
+            filters.push((row) => values.includes(row[field]));
+            return builder;
+          },
+          not(field: string, operator: string, value: any) {
+            if (operator === 'is' && value === null) {
+              filters.push((row) => row[field] !== null);
+              return builder;
+            }
+            throw new Error(`Unsupported not operator in mock: ${operator}`);
+          },
           then(onFulfilled: (value: any) => any, onRejected?: (reason: any) => any) {
             try {
               const filtered = filters.reduce((result, filter) => result.filter(filter), rows);
-              const projected = filtered.map((row) => {
-                const projection: Record<string, any> = {};
-                for (const field of fields) projection[field] = row[field];
-                return projection;
-              });
+              const result =
+                options?.count === 'exact' && options?.head
+                  ? { data: null, count: filtered.length, error: null }
+                  : {
+                      data: filtered.map((row) => {
+                        const projection: Record<string, any> = {};
+                        for (const field of fields) projection[field] = row[field];
+                        return projection;
+                      }),
+                      error: null,
+                    };
 
-              return Promise.resolve({ data: projected, error: null }).then(onFulfilled, onRejected);
+              return Promise.resolve(result).then(onFulfilled, onRejected);
             } catch (error) {
               if (onRejected) return Promise.reject(error).catch(onRejected);
               return Promise.reject(error);
@@ -189,5 +206,26 @@ describe('translation worker', () => {
 
     expect(db.translation_jobs[0]).toMatchObject({ status: 'pending' });
     expect(db.job_queue[0]).toMatchObject({ processed: false });
+  });
+
+  it('uses translation memory to avoid DeepL calls when available', async () => {
+    db.translation_memory.push({
+      site_id: 'site-001',
+      source_lang: 'en',
+      target_lang: 'es',
+      segment_hash: 'hash-1',
+      translated_text: 'Hola mundo (cached)',
+      created_at: new Date().toISOString(),
+    });
+
+    await processTranslationJob(jobId);
+
+    // Only FR should go to DeepL; ES should be fulfilled from cache.
+    expect(mockTranslateBatch).toHaveBeenCalledTimes(1);
+    expect(db.translation_segments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'seg-1', translated_text: 'Hola mundo (cached)' }),
+      ]),
+    );
   });
 });

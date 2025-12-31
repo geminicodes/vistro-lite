@@ -28,4 +28,26 @@ describe('splitHtmlToSegments', () => {
       expectedTexts.map((text) => sha256Hex(text).slice(0, 16)),
     );
   });
+
+  it('does not extract script/style content and extracts common attributes', () => {
+    const html = `
+      <div>
+        <script>console.log("do not translate")</script>
+        <style>.x { content: "do not translate"; }</style>
+        <p title="Greeting title">Hello <span aria-label="Accessible label">world</span></p>
+        <input placeholder="Your name" />
+        <img alt="Alt text" />
+      </div>
+    `;
+
+    const segments = splitHtmlToSegments(html);
+    const texts = segments.map((s) => s.text);
+
+    expect(texts).toContain('Hello world');
+    expect(texts).toContain('Greeting title');
+    expect(texts).toContain('Accessible label');
+    expect(texts).toContain('Your name');
+    expect(texts).toContain('Alt text');
+    expect(texts.join(' ')).not.toMatch(/do not translate/i);
+  });
 });

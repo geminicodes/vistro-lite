@@ -9,6 +9,8 @@ import {
   upsertTranslationMemory,
 } from './supabaseServer';
 
+const SOURCE_LANG_DEFAULT = 'auto';
+
 interface TranslationJobRow {
   id: string;
   site_id: string;
@@ -56,6 +58,72 @@ const groupSegmentsByTarget = (
   return groups;
 };
 
+const buildCacheKey = (segmentHash: string, targetLang: string): string => `${segmentHash}:${targetLang}`;
+
+const applyCacheToPendingSegments = async (
+  supabase: ReturnType<typeof createSupabaseServiceClient>,
+  siteId: string,
+  pendingSegments: TranslationSegmentRow[],
+): Promise<{ cachedUpdates: Array<{ id: string; job_id: string; translated_text: string }>; remaining: TranslationSegmentRow[] }> => {
+  if (pendingSegments.length === 0) {
+    return { cachedUpdates: [], remaining: [] };
+  }
+
+  const uniqueHashes = Array.from(new Set(pendingSegments.map((seg) => seg.segment_hash)));
+  const uniqueTargets = Array.from(new Set(pendingSegments.map((seg) => seg.target_lang)));
+
+  const { data, error } = await supabase
+    .from('translation_memory')
+    .select('segment_hash,target_lang,translated_text')
+    .eq('site_id', siteId)
+    .in('segment_hash', uniqueHashes)
+    .in('target_lang', uniqueTargets);
+
+  if (error) {
+    // Cache is an optimization: do not fail the job for cache read errors.
+    warn('Worker failed to read translation memory (continuing)', {
+      siteId,
+      error: error.message,
+    });
+    return { cachedUpdates: [], remaining: pendingSegments };
+  }
+
+  const map = new Map<string, string>();
+  for (const row of data ?? []) {
+    const key = buildCacheKey(row.segment_hash, row.target_lang);
+    map.set(key, row.translated_text ?? '');
+  }
+
+  const cachedUpdates: Array<{ id: string; job_id: string; translated_text: string }> = [];
+  const remaining: TranslationSegmentRow[] = [];
+
+  for (const seg of pendingSegments) {
+    const cached = map.get(buildCacheKey(seg.segment_hash, seg.target_lang));
+    if (cached !== undefined && cached !== null && cached !== '') {
+      cachedUpdates.push({ id: seg.id, job_id: seg.job_id, translated_text: cached });
+    } else {
+      remaining.push(seg);
+    }
+  }
+
+  return { cachedUpdates, remaining };
+};
+
+const updateJobProgress = async (
+  supabase: ReturnType<typeof createSupabaseServiceClient>,
+  jobId: string,
+): Promise<void> => {
+  const { count, error } = await supabase
+    .from('translation_segments')
+    .select('id', { count: 'exact', head: true })
+    .eq('job_id', jobId)
+    .not('translated_text', 'is', null);
+
+  if (!error) {
+    await supabase.from('translation_jobs').update({ translated_segments: count ?? 0 }).eq('id', jobId);
+  }
+};
+
 export const processTranslationJob = async (jobId: string): Promise<void> => {
   const supabase = createSupabaseServiceClient();
 
@@ -99,7 +167,27 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
     return;
   }
 
-  const groupedSegments = groupSegmentsByTarget(pendingSegments);
+  // Re-check cache at processing time to avoid duplicate DeepL calls under concurrency.
+  const { cachedUpdates, remaining } = await applyCacheToPendingSegments(supabase, job.site_id, pendingSegments);
+
+  if (cachedUpdates.length > 0) {
+    const { error: cachedUpdateError } = await supabase
+      .from('translation_segments')
+      .upsert(cachedUpdates, { onConflict: 'id' });
+
+    if (cachedUpdateError) {
+      throw new Error(`Failed to apply cached translations: ${cachedUpdateError.message}`);
+    }
+  }
+
+  await updateJobProgress(supabase, jobId);
+
+  if (remaining.length === 0) {
+    info('Worker completed job using cache only', { jobId });
+    return;
+  }
+
+  const groupedSegments = groupSegmentsByTarget(remaining);
 
   info('Worker processing translation job', { jobId, groups: groupedSegments.size });
 
@@ -134,7 +222,7 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
       updates.push({ id: segment.id, job_id: segment.job_id, translated_text: translatedText });
       memoryEntries.push({
         siteId: job.site_id,
-        sourceLang: segment.source_lang ?? 'auto',
+        sourceLang: segment.source_lang ?? SOURCE_LANG_DEFAULT,
         targetLang,
         segmentHash: segment.segment_hash,
         translatedText,
@@ -150,6 +238,7 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
     }
 
     await upsertTranslationMemory(memoryEntries, supabase);
+    await updateJobProgress(supabase, jobId);
   }
 
   info('Worker finished translating job segments', { jobId });

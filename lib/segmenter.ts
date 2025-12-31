@@ -5,6 +5,7 @@ import { sha256Hex } from './hash';
 const MIN_SEGMENT_LENGTH = 3;
 const BLOCK_TAGS = new Set([
   'p',
+  'div',
   'h1',
   'h2',
   'h3',
@@ -15,7 +16,8 @@ const BLOCK_TAGS = new Set([
   'blockquote',
   'figcaption',
 ]);
-const ATTRIBUTE_KEYS = ['alt', 'title'] as const;
+const ATTRIBUTE_KEYS = ['alt', 'title', 'aria-label', 'placeholder'] as const;
+const SKIP_TAGS = new Set(['script', 'style', 'noscript']);
 
 interface HtmlNodeLike {
   rawTagName?: string;
@@ -52,7 +54,7 @@ const extractAttributeFromRaw = (rawAttrs: string | undefined, key: string): str
     return undefined;
   }
 
-  const pattern = new RegExp(`${key}\\s*=\\s*"([^"]+)"`, 'i');
+  const pattern = new RegExp(`${key.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}\\s*=\\s*"([^"]+)"`, 'i');
   const match = pattern.exec(rawAttrs);
   return match ? match[1] : undefined;
 };
@@ -73,21 +75,36 @@ const getParser = (): ParserModule | null => {
   return cachedParser;
 };
 
-const getNodeText = (node: HtmlNodeLike): string => {
-  if (typeof node.innerText === 'string' && node.innerText.length > 0) {
-    return node.innerText;
+const getNodeTextFiltered = (node: HtmlNodeLike): string => {
+  const tagName = node.rawTagName?.toLowerCase() ?? '';
+
+  if (tagName && SKIP_TAGS.has(tagName)) {
+    return '';
+  }
+
+  // Best-effort comment skipping (parser-dependent).
+  if (tagName === '#comment' || tagName === 'comment') {
+    return '';
+  }
+
+  if (Array.isArray(node.childNodes) && node.childNodes.length > 0) {
+    return node.childNodes.map(getNodeTextFiltered).join(' ');
   }
 
   if (typeof node.textContent === 'string' && node.textContent.length > 0) {
     return node.textContent;
   }
 
-  if (typeof node.rawText === 'string' && node.rawText.length > 0) {
-    return node.rawText;
+  if (typeof node.innerText === 'string' && node.innerText.length > 0) {
+    return node.innerText;
   }
 
-  if (Array.isArray(node.childNodes)) {
-    return node.childNodes.map(getNodeText).join(' ');
+  if (typeof node.rawText === 'string' && node.rawText.length > 0) {
+    // Avoid picking up raw HTML comments if present.
+    if (node.rawText.trim().startsWith('<!--')) {
+      return '';
+    }
+    return node.rawText;
   }
 
   return '';
@@ -173,8 +190,12 @@ const traverseNode = (
 ): void => {
   const tagName = node.rawTagName?.toLowerCase() ?? '';
 
+  if (tagName && SKIP_TAGS.has(tagName)) {
+    return;
+  }
+
   if (tagName && BLOCK_TAGS.has(tagName)) {
-    const text = getNodeText(node);
+    const text = getNodeTextFiltered(node);
     const selector = buildSelector(context);
     addSegment(segments, text, selector);
   }
@@ -212,18 +233,20 @@ const stripTags = (snippet: string): string => snippet.replace(/<[^>]+>/g, ' ');
 
 const fallbackParse = (html: string): HtmlSegment[] => {
   const segments: HtmlSegment[] = [];
+  const stripped = html.replace(/<\s*(script|style|noscript)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, ' ');
+  const withoutComments = stripped.replace(/<!--([\s\S]*?)-->/g, ' ');
   const blockRegex =
-    /<\s*(p|h[1-6]|li|blockquote|figcaption)[^>]*>([\s\S]*?)<\/\s*\1\s*>/gi;
+    /<\s*(p|div|h[1-6]|li|blockquote|figcaption)[^>]*>([\s\S]*?)<\/\s*\1\s*>/gi;
   let match: RegExpExecArray | null;
 
-  while ((match = blockRegex.exec(html)) !== null) {
+  while ((match = blockRegex.exec(withoutComments)) !== null) {
     const text = collapseWhitespace(stripTags(match[2]));
     addSegment(segments, text, undefined);
   }
 
-  const attributeRegex = /\b(alt|title)\s*=\s*"([^"]+)"/gi;
+  const attributeRegex = /\b(alt|title|aria-label|placeholder)\s*=\s*"([^"]+)"/gi;
 
-  while ((match = attributeRegex.exec(html)) !== null) {
+  while ((match = attributeRegex.exec(withoutComments)) !== null) {
     const text = collapseWhitespace(match[2]);
     addSegment(segments, text, undefined);
   }
