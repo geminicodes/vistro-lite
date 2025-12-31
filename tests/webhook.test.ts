@@ -21,9 +21,35 @@ vi.mock('../lib/supabaseServer', () => ({
   createSupabaseServiceClient: mockCreateSupabaseServiceClient,
 }));
 
+const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value));
+
 const createMockSupabaseClient = (db: MockDb) => ({
   from(table: TableName) {
     return {
+      select(_columns: string, options?: { count?: 'exact'; head?: boolean }) {
+        const filters: Array<(row: any) => boolean> = [];
+        const builder: any = {
+          eq(field: string, value: any) {
+            filters.push((row) => row[field] === value);
+            return builder;
+          },
+          then(onFulfilled: (value: any) => any, onRejected?: (reason: any) => any) {
+            try {
+              const filtered = db[table].filter((row) => filters.every((fn) => fn(row)));
+              const result =
+                options?.count === 'exact' && options?.head
+                  ? { data: null, count: filtered.length, error: null }
+                  : { data: filtered.map(clone), error: null };
+              return Promise.resolve(result).then(onFulfilled, onRejected);
+            } catch (error) {
+              if (onRejected) return Promise.reject(error).catch(onRejected);
+              return Promise.reject(error);
+            }
+          },
+        };
+
+        return builder;
+      },
       upsert(payload: any, options?: { onConflict?: string }) {
         const rows = Array.isArray(payload) ? payload : [payload];
         const conflictKeys = options?.onConflict?.split(',').map((key) => key.trim()) ?? [];

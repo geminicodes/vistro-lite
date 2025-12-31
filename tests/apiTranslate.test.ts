@@ -4,11 +4,7 @@ import { sha256Hex } from '../lib/hash';
 import { splitHtmlToSegments } from '../lib/segmenter';
 import { POST } from '../app/api/translate/route';
 
-type TableName =
-  | 'translation_jobs'
-  | 'translation_segments'
-  | 'translation_memory'
-  | 'job_queue';
+type TableName = 'translation_jobs' | 'translation_segments' | 'translation_memory' | 'job_queue';
 
 interface MockDb {
   translation_jobs: any[];
@@ -20,35 +16,31 @@ interface MockDb {
 const { mockCreateSupabaseServiceClient } = vi.hoisted(() => ({
   mockCreateSupabaseServiceClient: vi.fn(),
 }));
- 
+
 vi.mock('../lib/supabaseServer', () => ({
   createSupabaseServiceClient: mockCreateSupabaseServiceClient,
   upsertTranslationMemory: vi.fn(),
 }));
 
-  const cloneRow = (row: any) => JSON.parse(JSON.stringify(row));
+const cloneRow = (row: any) => JSON.parse(JSON.stringify(row));
 
-  const applyFilters = (rows: any[], filters: Array<(row: any) => boolean>) =>
-    filters.reduce((result, filter) => result.filter(filter), rows);
+const applyFilters = (rows: any[], filters: Array<(row: any) => boolean>) =>
+  filters.reduce((result, filter) => result.filter(filter), rows);
 
-  const projectRows = (rows: any[], columns: string) => {
-    if (!columns || columns === '*') {
-      return rows.map(cloneRow);
-    }
+const projectRows = (rows: any[], columns: string) => {
+  if (!columns || columns === '*') {
+    return rows.map(cloneRow);
+  }
 
-    const fields = columns.split(',').map((col) => col.trim());
+  const fields = columns.split(',').map((col) => col.trim());
+  return rows.map((row) => {
+    const projected: Record<string, any> = {};
+    for (const field of fields) projected[field] = row[field];
+    return projected;
+  });
+};
 
-    return rows.map((row) => {
-      const projected: Record<string, any> = {};
-
-      for (const field of fields) {
-        projected[field] = row[field];
-      }
-
-      return projected;
-    });
-  };
-
+const createMockSupabaseClient = (db: MockDb) => {
   const buildSelectBuilder = (
     table: TableName,
     columns: string,
@@ -72,23 +64,15 @@ vi.mock('../lib/supabaseServer', () => ({
       then(onFulfilled: (value: any) => any, onRejected?: (reason: any) => any) {
         try {
           const filtered = applyFilters(db[table], filters);
-
           const result =
             options?.count === 'exact' && options?.head
               ? { data: null, count: filtered.length, error: null }
               : { data: projectRows(filtered, columns), error: null };
-
           return Promise.resolve(result).then(onFulfilled, onRejected);
         } catch (error) {
-          if (onRejected) {
-            return Promise.reject(error).catch(onRejected);
-          }
-
+          if (onRejected) return Promise.reject(error).catch(onRejected);
           return Promise.reject(error);
         }
-      },
-      catch(onRejected: (reason: any) => any) {
-        return Promise.reject(new Error('Unhandled mock select error')).catch(onRejected);
       },
     };
 
@@ -108,6 +92,51 @@ vi.mock('../lib/supabaseServer', () => ({
         },
       };
     },
+    rpc(fnName: string, args: any) {
+      if (fnName !== 'enqueue_translation_job') {
+        return Promise.resolve({ data: null, error: new Error(`Unsupported rpc: ${fnName}`) });
+      }
+
+      const jobId = crypto.randomUUID();
+      const nowIso = new Date().toISOString();
+
+      db.translation_jobs.push(
+        cloneRow({
+          id: jobId,
+          site_id: args.p_site_id,
+          source_url: args.p_source_url ?? null,
+          status: 'pending',
+          created_at: nowIso,
+        }),
+      );
+
+      const segments = Array.isArray(args.p_segments) ? args.p_segments : [];
+      for (const seg of segments) {
+        db.translation_segments.push(
+          cloneRow({
+            id: crypto.randomUUID(),
+            job_id: jobId,
+            source_lang: seg.source_lang ?? 'auto',
+            target_lang: seg.target_lang,
+            segment_hash: seg.segment_hash,
+            source_text: seg.source_text,
+            translated_text: null,
+            created_at: nowIso,
+          }),
+        );
+      }
+
+      db.job_queue.push(
+        cloneRow({
+          id: db.job_queue.length + 1,
+          job_id: jobId,
+          processed: false,
+          enqueued_at: nowIso,
+        }),
+      );
+
+      return Promise.resolve({ data: jobId, error: null });
+    },
   };
 };
 
@@ -124,11 +153,13 @@ describe('POST /api/translate', () => {
 
     mockCreateSupabaseServiceClient.mockReturnValue(createMockSupabaseClient(db));
     process.env.TRANSLATE_MAX_PAGES_PER_MINUTE = '5';
+    process.env.TRANSLATE_API_KEY = 'test-api-key';
   });
 
   afterEach(() => {
     mockCreateSupabaseServiceClient.mockReset();
     delete process.env.TRANSLATE_MAX_PAGES_PER_MINUTE;
+    delete process.env.TRANSLATE_API_KEY;
   });
 
   it('creates a translation job for cache misses and returns counts', async () => {
@@ -159,6 +190,7 @@ describe('POST /api/translate', () => {
         html,
         targetLocales,
       }),
+      headers: { authorization: `Bearer ${process.env.TRANSLATE_API_KEY}` },
     });
 
     const response = await POST(request);
@@ -203,10 +235,11 @@ describe('POST /api/translate', () => {
         html,
         targetLocales,
       }),
+      headers: { authorization: `Bearer ${process.env.TRANSLATE_API_KEY}` },
     });
 
     const response = await POST(request);
-    const json = await response.json();
+    const json = (await response.json()) as any;
 
     expect(response.status).toBe(200);
     expect(json.cachedCount).toBe(segments.length);
