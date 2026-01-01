@@ -252,4 +252,24 @@ describe('POST /api/translate', () => {
     expect(db.translation_segments).toHaveLength(0);
     expect(db.job_queue).toHaveLength(0);
   });
+
+  it('rejects when both url and html are provided', async () => {
+    const siteId = '123e4567-e89b-12d3-a456-426614174000';
+    const request = new Request('http://localhost/api/translate', {
+      method: 'POST',
+      body: JSON.stringify({
+        siteId,
+        url: 'https://example.com',
+        html: '<p>Hello</p>',
+        targetLocales: ['es'],
+      }),
+      headers: { authorization: 'Bearer user-jwt' },
+    });
+
+    const response = await POST(request);
+    const json = (await response.json()) as any;
+
+    expect(response.status).toBe(400);
+    expect(json.error?.code).toBe('bad_request');
+  });
 });

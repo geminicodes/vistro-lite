@@ -184,6 +184,13 @@ export async function POST(request: Request): Promise<Response> {
 
   const { siteId, url, html: providedHtml, targetLocales } = body;
 
+  if (url && providedHtml) {
+    return NextResponse.json(
+      { error: { code: 'bad_request', message: 'Provide either "url" or "html", not both.' } },
+      { status: 400 },
+    );
+  }
+
   if (!url && !providedHtml) {
     return NextResponse.json(
       { error: { code: 'bad_request', message: 'Either "url" or "html" must be provided.' } },
@@ -258,6 +265,38 @@ export async function POST(request: Request): Promise<Response> {
 
   const service = createSupabaseServiceClient();
 
+  // Compute cache hit/miss counts for observability (best-effort).
+  let cacheHits = 0;
+  let cacheMisses = 0;
+  try {
+    const uniqueHashes = Array.from(new Set(segments.map((segment) => sha256Hex(segment.text))));
+    const uniqueTargets = Array.from(new Set(targetLocales));
+
+    const { data: memoryRows, error: memoryError } = await service
+      .from('translation_memory')
+      .select('segment_hash,target_lang,translated_text')
+      .eq('site_id', siteId)
+      .in('segment_hash', uniqueHashes)
+      .in('target_lang', uniqueTargets);
+
+    if (!memoryError) {
+      const memMap = new Map<string, string>();
+      for (const row of (memoryRows as any[] | null) ?? []) {
+        memMap.set(`${row.segment_hash}:${row.target_lang}`, row.translated_text ?? '');
+      }
+
+      for (const hash of uniqueHashes) {
+        for (const targetLang of uniqueTargets) {
+          const cached = memMap.get(`${hash}:${targetLang}`);
+          if (cached) cacheHits += 1;
+          else cacheMisses += 1;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+
   // Transactional enqueue: job + segments + queue via Postgres function.
   const idempotencyKeyRaw = request.headers.get('idempotency-key')?.trim() ?? '';
   const idempotencyKey = idempotencyKeyRaw && idempotencyKeyRaw.length <= 128 ? idempotencyKeyRaw : null;
@@ -292,6 +331,8 @@ export async function POST(request: Request): Promise<Response> {
     jobId,
     segments: segments.length,
     targets: targetLocales.length,
+    cacheHits,
+    cacheMisses,
   });
 
   return NextResponse.json({ jobId, segments: segments.length }, { status: 200 });
