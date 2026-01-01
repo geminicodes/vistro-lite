@@ -117,7 +117,7 @@ const requestDeepLChunk = async (
 
   const { apiKey, baseUrl, timeoutMs, maxRetries, userAgent } = config;
 
-  const executeRequest = async (attempt: number): Promise<string[]> => {
+  const executeRequest = async (): Promise<string[]> => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     const body = buildRequestBody(texts, targetLang);
@@ -198,7 +198,7 @@ const requestDeepLChunk = async (
     retries: maxRetries,
     minMs: Math.min(500, timeoutMs),
     maxMs: timeoutMs,
-    onRetry: (error, attempt, delay) => {
+    onRetry: (attempt, error, delay) => {
       warn('[DeepL] Retrying request', {
         attempt,
         delayMs: delay,

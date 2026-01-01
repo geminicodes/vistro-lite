@@ -24,6 +24,8 @@ describe('retryWithBackoff', () => {
       retries: 3,
       minMs: 100,
       maxMs: 800,
+      factor: 2,
+      jitter: 0,
     });
 
     await vi.runAllTimersAsync();
