@@ -2,130 +2,80 @@
 
 import { sha256Hex } from './hash';
 
-const MIN_SEGMENT_LENGTH = 3;
-const BLOCK_TAGS = new Set([
-  'p',
-  'div',
-  'h1',
-  'h2',
-  'h3',
-  'h4',
-  'h5',
-  'h6',
-  'li',
-  'blockquote',
-  'figcaption',
-]);
-const ATTRIBUTE_KEYS = ['alt', 'title', 'aria-label', 'placeholder'] as const;
-const SKIP_TAGS = new Set(['script', 'style', 'noscript']);
-
-interface HtmlNodeLike {
+type HtmlNodeLike = {
   rawTagName?: string;
-  rawAttrs?: string;
-  innerText?: string;
-  textContent?: string;
-  rawText?: string;
+  parentNode?: HtmlNodeLike | null;
   childNodes?: HtmlNodeLike[];
-  getAttribute?: (name: string) => string | undefined;
-}
-
-interface ParserModule {
-  parse: (html: string) => HtmlNodeLike;
-}
-
-interface SelectorContext {
-  parent?: SelectorContext;
-  tagName: string;
-  index: number;
-}
+  text?: string;
+  textContent?: string;
+  innerText?: string;
+};
 
 export interface HtmlSegment {
   id: string;
-  selector?: string;
   text: string;
+  selector?: string;
 }
 
-let cachedParser: ParserModule | null | undefined;
+const TARGET_TAGS = new Set(['p', 'li', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'figcaption']);
+const MIN_SEGMENT_LENGTH = 3;
 
 const collapseWhitespace = (value: string): string => value.replace(/\s+/g, ' ').trim();
 
-const extractAttributeFromRaw = (rawAttrs: string | undefined, key: string): string | undefined => {
-  if (!rawAttrs) {
-    return undefined;
-  }
-
-  const pattern = new RegExp(`${key.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}\\s*=\\s*"([^"]+)"`, 'i');
-  const match = pattern.exec(rawAttrs);
-  return match ? match[1] : undefined;
+const getNodeText = (node: HtmlNodeLike): string => {
+  const candidate =
+    (typeof node.text === 'string' && node.text) ||
+    (typeof node.textContent === 'string' && node.textContent) ||
+    (typeof node.innerText === 'string' && node.innerText) ||
+    '';
+  return collapseWhitespace(candidate);
 };
 
-const getParser = (): ParserModule | null => {
-  if (cachedParser !== undefined) {
-    return cachedParser;
+const isElementNode = (node: HtmlNodeLike): boolean => Boolean(node && typeof node.rawTagName === 'string' && node.rawTagName);
+
+const getTagName = (node: HtmlNodeLike): string => (node.rawTagName ?? '').toLowerCase();
+
+const getNthOfType = (node: HtmlNodeLike): number => {
+  const parent = node.parentNode;
+  if (!parent || !Array.isArray(parent.childNodes)) {
+    return 1;
   }
 
-  try {
-    // eslint-disable-next-line global-require, @typescript-eslint/no-var-requires
-    const moduleRef = require('node-html-parser') as ParserModule;
-    cachedParser = moduleRef;
-  } catch {
-    cachedParser = null;
+  const tag = getTagName(node);
+  if (!tag) {
+    return 1;
   }
 
-  return cachedParser;
-};
-
-const getNodeTextFiltered = (node: HtmlNodeLike): string => {
-  const tagName = node.rawTagName?.toLowerCase() ?? '';
-
-  if (tagName && SKIP_TAGS.has(tagName)) {
-    return '';
-  }
-
-  // Best-effort comment skipping (parser-dependent).
-  if (tagName === '#comment' || tagName === 'comment') {
-    return '';
-  }
-
-  if (Array.isArray(node.childNodes) && node.childNodes.length > 0) {
-    return node.childNodes.map(getNodeTextFiltered).join(' ');
-  }
-
-  if (typeof node.textContent === 'string' && node.textContent.length > 0) {
-    return node.textContent;
-  }
-
-  if (typeof node.innerText === 'string' && node.innerText.length > 0) {
-    return node.innerText;
-  }
-
-  if (typeof node.rawText === 'string' && node.rawText.length > 0) {
-    // Avoid picking up raw HTML comments if present.
-    if (node.rawText.trim().startsWith('<!--')) {
-      return '';
+  let index = 0;
+  for (const sibling of parent.childNodes) {
+    if (!isElementNode(sibling)) {
+      continue;
     }
-    return node.rawText;
+    if (getTagName(sibling) !== tag) {
+      continue;
+    }
+    index += 1;
+    if (sibling === node) {
+      return index;
+    }
   }
 
-  return '';
+  return 1;
 };
 
-const buildSelector = (context: SelectorContext | undefined): string | undefined => {
-  if (!context) {
-    return undefined;
-  }
-
+const buildSelector = (node: HtmlNodeLike): string | undefined => {
   const parts: string[] = [];
-  let current: SelectorContext | undefined = context;
+  let current: HtmlNodeLike | null | undefined = node;
 
   while (current) {
-    if (!current.tagName) {
+    const tag = getTagName(current);
+    if (!tag) {
       break;
     }
 
-    const suffix = current.index > 0 ? `:nth-of-type(${current.index})` : '';
-    parts.push(`${current.tagName}${suffix}`);
-    current = current.parent;
+    const nth = getNthOfType(current);
+    parts.push(nth > 1 ? `${tag}:nth-of-type(${nth})` : tag);
+    current = current.parentNode ?? null;
   }
 
   if (parts.length === 0) {
@@ -135,161 +85,71 @@ const buildSelector = (context: SelectorContext | undefined): string | undefined
   return parts.reverse().join(' > ');
 };
 
-const addAttributeSegments = (
-  node: HtmlNodeLike,
-  selector: string | undefined,
-  segments: HtmlSegment[],
-): void => {
-  for (const attributeKey of ATTRIBUTE_KEYS) {
-    const attributeValue =
-      node.getAttribute?.(attributeKey) ?? extractAttributeFromRaw(node.rawAttrs, attributeKey);
-
-    if (!attributeValue) {
-      continue;
-    }
-
-    const text = collapseWhitespace(attributeValue);
-
-    if (text.length < MIN_SEGMENT_LENGTH) {
-      continue;
-    }
-
-    const id = sha256Hex(text).slice(0, 16);
-    const attributeSelector = selector ? `${selector}::attr(${attributeKey})` : undefined;
-
-    segments.push({
-      id,
-      selector: attributeSelector,
-      text,
-    });
-  }
-};
-
-const addSegment = (
-  segments: HtmlSegment[],
-  text: string,
-  selector: string | undefined,
-): void => {
-  const normalized = collapseWhitespace(text);
-
-  if (normalized.length < MIN_SEGMENT_LENGTH) {
+const traverseDepthFirst = (node: HtmlNodeLike, onVisit: (node: HtmlNodeLike) => void): void => {
+  if (!node) {
     return;
   }
 
-  segments.push({
-    id: sha256Hex(normalized).slice(0, 16),
-    selector,
-    text: normalized,
-  });
-};
-
-const traverseNode = (
-  node: HtmlNodeLike,
-  context: SelectorContext | undefined,
-  segments: HtmlSegment[],
-): void => {
-  const tagName = node.rawTagName?.toLowerCase() ?? '';
-
-  if (tagName && SKIP_TAGS.has(tagName)) {
-    return;
-  }
-
-  if (tagName && BLOCK_TAGS.has(tagName)) {
-    const text = getNodeTextFiltered(node);
-    const selector = buildSelector(context);
-    addSegment(segments, text, selector);
-  }
-
-  if (tagName) {
-    const selector = buildSelector(context);
-    addAttributeSegments(node, selector, segments);
-  }
+  onVisit(node);
 
   if (!Array.isArray(node.childNodes) || node.childNodes.length === 0) {
     return;
   }
 
-  const counters = new Map<string, number>();
-
   for (const child of node.childNodes) {
-    const childTag = child.rawTagName?.toLowerCase() ?? '';
-    let nextContext = context;
-
-    if (childTag) {
-      const count = (counters.get(childTag) ?? 0) + 1;
-      counters.set(childTag, count);
-      nextContext = {
-        parent: context,
-        tagName: childTag,
-        index: count,
-      };
-    }
-
-    traverseNode(child, nextContext, segments);
+    traverseDepthFirst(child, onVisit);
   }
-};
-
-const stripTags = (snippet: string): string => snippet.replace(/<[^>]+>/g, ' ');
-
-const fallbackParse = (html: string): HtmlSegment[] => {
-  const segments: HtmlSegment[] = [];
-  const stripped = html.replace(/<\s*(script|style|noscript)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, ' ');
-  const withoutComments = stripped.replace(/<!--([\s\S]*?)-->/g, ' ');
-  const blockRegex =
-    /<\s*(p|div|h[1-6]|li|blockquote|figcaption)[^>]*>([\s\S]*?)<\/\s*\1\s*>/gi;
-  let match: RegExpExecArray | null;
-
-  while ((match = blockRegex.exec(withoutComments)) !== null) {
-    const text = collapseWhitespace(stripTags(match[2]));
-    addSegment(segments, text, undefined);
-  }
-
-  const attributeRegex = /\b(alt|title|aria-label|placeholder)\s*=\s*"([^"]+)"/gi;
-
-  while ((match = attributeRegex.exec(withoutComments)) !== null) {
-    const text = collapseWhitespace(match[2]);
-    addSegment(segments, text, undefined);
-  }
-
-  return segments;
 };
 
 /**
- * Split loosely structured HTML into deterministic text segments.
+ * Split HTML into deterministic, stable text segments.
  *
- * Segmentation prioritises block-level tags and select descriptive attributes.
- * The approach is heuristic, so expect occasional false positives or merged
- * snippets for unusual markup. TODO: enrich selector generation with more
- * precise DOM context to improve worker traceability.
+ * Extracts text from: p, li, h1-h6, blockquote, figcaption.
+ * Segments are ordered in document order.
  *
- * @param html - Raw HTML string.
- * @returns Ordered segments including SHA-256 identifiers.
+ * TODO: inject `data-vistro-id="<segment.id>"` attributes into source HTML for
+ *       precise reassembly and future-proof DOM addressing.
  */
 export const splitHtmlToSegments = (html: string): HtmlSegment[] => {
   if (!html || !html.trim()) {
     return [];
   }
 
-  const parser = getParser();
+  // Requirement: use node-html-parser.
+  // eslint-disable-next-line global-require, @typescript-eslint/no-var-requires
+  const { parse } = require('node-html-parser') as { parse: (html: string, options?: any) => HtmlNodeLike };
 
-  if (parser) {
-    try {
-      const root = parser.parse(html);
-      const segments: HtmlSegment[] = [];
+  const root = parse(html, {
+    lowerCaseTagName: true,
+    comment: false,
+  });
 
-      traverseNode(
-        root,
-        undefined,
-        segments,
-      );
+  const segments: HtmlSegment[] = [];
+  const seen = new Set<string>(); // de-dup by id (derived from normalized text)
 
-      if (segments.length > 0) {
-        return segments;
-      }
-    } catch {
-      // Intentionally fall back to regex parser below.
+  traverseDepthFirst(root, (node) => {
+    const tag = getTagName(node);
+    if (!tag || !TARGET_TAGS.has(tag)) {
+      return;
     }
-  }
 
-  return fallbackParse(html);
+    const text = getNodeText(node);
+    if (text.length < MIN_SEGMENT_LENGTH) {
+      return;
+    }
+
+    const id = sha256Hex(text).slice(0, 16);
+    if (seen.has(id)) {
+      return;
+    }
+
+    seen.add(id);
+    segments.push({
+      id,
+      text,
+      selector: buildSelector(node),
+    });
+  });
+
+  return segments;
 };

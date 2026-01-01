@@ -198,7 +198,7 @@ export const processTranslationJob = async (jobId: string): Promise<void> => {
         retries: WORKER_RETRIES,
         minMs: WORKER_MIN_DELAY_MS,
         maxMs: WORKER_MAX_DELAY_MS,
-        onRetry: (error, attempt, delay) => {
+        onRetry: (attempt, error, delay) => {
           warn('Retrying translation batch', {
             jobId,
             targetLang,

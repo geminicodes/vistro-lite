@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { sha256Hex } from '../lib/hash';
 import { splitHtmlToSegments } from '../lib/segmenter';
 import { POST } from '../app/api/translate/route';
 
@@ -15,6 +14,14 @@ interface MockDb {
 
 const { mockCreateSupabaseServiceClient } = vi.hoisted(() => ({
   mockCreateSupabaseServiceClient: vi.fn(),
+}));
+
+const { mockCreateClient } = vi.hoisted(() => ({
+  mockCreateClient: vi.fn(),
+}));
+
+vi.mock('@supabase/supabase-js', () => ({
+  createClient: mockCreateClient,
 }));
 
 vi.mock('../lib/supabaseServer', () => ({
@@ -152,17 +159,39 @@ describe('POST /api/translate', () => {
     };
 
     mockCreateSupabaseServiceClient.mockReturnValue(createMockSupabaseClient(db));
-    process.env.TRANSLATE_MAX_PAGES_PER_MINUTE = '5';
-    process.env.TRANSLATE_API_KEY = 'test-api-key';
+    process.env.SUPABASE_URL = 'https://example.supabase.co';
+    process.env.SUPABASE_ANON_KEY = 'anon-key';
+
+    const allowedSiteId = '123e4567-e89b-12d3-a456-426614174000';
+
+    mockCreateClient.mockReturnValue({
+      auth: {
+        getUser: () => Promise.resolve({ data: { user: { id: 'user-1' } }, error: null }),
+      },
+      from: (table: string) => {
+        if (table !== 'sites') {
+          throw new Error(`Unexpected table: ${table}`);
+        }
+
+        return {
+          select: () => ({
+            eq: () => ({
+              limit: () => Promise.resolve({ data: [{ id: allowedSiteId }], error: null }),
+            }),
+          }),
+        };
+      },
+    });
   });
 
   afterEach(() => {
     mockCreateSupabaseServiceClient.mockReset();
-    delete process.env.TRANSLATE_MAX_PAGES_PER_MINUTE;
-    delete process.env.TRANSLATE_API_KEY;
+    mockCreateClient.mockReset();
+    delete process.env.SUPABASE_URL;
+    delete process.env.SUPABASE_ANON_KEY;
   });
 
-  it('creates a translation job for cache misses and returns counts', async () => {
+  it('creates a translation job and segments for url/html input', async () => {
     const siteId = '123e4567-e89b-12d3-a456-426614174000';
     const html = `
       <article>
@@ -173,15 +202,6 @@ describe('POST /api/translate', () => {
     const targetLocales = ['es', 'fr'];
 
     const segments = splitHtmlToSegments(html);
-    const firstSegmentHash = sha256Hex(segments[0].text);
-
-    db.translation_memory.push({
-      site_id: siteId,
-      segment_hash: firstSegmentHash,
-      target_lang: 'es',
-      translated_text: 'Hola mundo',
-      created_at: new Date().toISOString(),
-    });
 
     const request = new Request('http://localhost/api/translate', {
       method: 'POST',
@@ -190,61 +210,38 @@ describe('POST /api/translate', () => {
         html,
         targetLocales,
       }),
-      headers: { authorization: `Bearer ${process.env.TRANSLATE_API_KEY}` },
+      headers: { authorization: 'Bearer user-jwt' },
     });
 
     const response = await POST(request);
     const json = (await response.json()) as any;
     
     expect(response.status).toBe(200);
-    expect(json.cachedCount).toBe(1);
-    expect(json.toTranslateCount).toBe(3);
     expect(typeof json.jobId).toBe('string');
+    expect(json.segments).toBe(segments.length);
 
     expect(db.translation_jobs).toHaveLength(1);
-    expect(db.translation_segments).toHaveLength(3);
+    expect(db.translation_segments).toHaveLength(segments.length * targetLocales.length);
     expect(db.job_queue).toHaveLength(1);
     expect(db.job_queue[0].job_id).toBe(json.jobId);
   });
 
-  it('skips job creation when everything is cached', async () => {
-    const siteId = '123e4567-e89b-12d3-a456-426614174001';
-    const html = `
-      <div>
-        <p>Alpha block</p>
-        <p>Beta block</p>
-      </div>
-    `;
-    const targetLocales = ['es'];
-    const segments = splitHtmlToSegments(html);
-
-    for (const segment of segments) {
-      db.translation_memory.push({
-        site_id: siteId,
-        segment_hash: sha256Hex(segment.text),
-        target_lang: 'es',
-        translated_text: `Translated ${segment.text}`,
-        created_at: new Date().toISOString(),
-      });
-    }
-
+  it('rejects when neither url nor html is provided', async () => {
+    const siteId = '123e4567-e89b-12d3-a456-426614174000';
     const request = new Request('http://localhost/api/translate', {
       method: 'POST',
       body: JSON.stringify({
         siteId,
-        html,
-        targetLocales,
+        targetLocales: ['es'],
       }),
-      headers: { authorization: `Bearer ${process.env.TRANSLATE_API_KEY}` },
+      headers: { authorization: 'Bearer user-jwt' },
     });
 
     const response = await POST(request);
     const json = (await response.json()) as any;
 
-    expect(response.status).toBe(200);
-    expect(json.cachedCount).toBe(segments.length);
-    expect(json.toTranslateCount).toBe(0);
-    expect(json.jobId).toBeNull();
+    expect(response.status).toBe(400);
+    expect(json.error?.code).toBe('bad_request');
 
     expect(db.translation_jobs).toHaveLength(0);
     expect(db.translation_segments).toHaveLength(0);

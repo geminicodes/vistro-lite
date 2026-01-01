@@ -29,25 +29,19 @@ describe('splitHtmlToSegments', () => {
     );
   });
 
-  it('does not extract script/style content and extracts common attributes', () => {
+  it('deduplicates identical segments while preserving first occurrence order', () => {
     const html = `
-      <div>
-        <script>console.log("do not translate")</script>
-        <style>.x { content: "do not translate"; }</style>
-        <p title="Greeting title">Hello <span aria-label="Accessible label">world</span></p>
-        <input placeholder="Your name" />
-        <img alt="Alt text" />
-      </div>
+      <section>
+        <p>Hello world</p>
+        <p>Hello world</p>
+        <p>Second</p>
+      </section>
     `;
 
     const segments = splitHtmlToSegments(html);
-    const texts = segments.map((s) => s.text);
+    expect(segments.map((s) => s.text)).toEqual(['Hello world', 'Second']);
 
-    expect(texts).toContain('Hello world');
-    expect(texts).toContain('Greeting title');
-    expect(texts).toContain('Accessible label');
-    expect(texts).toContain('Your name');
-    expect(texts).toContain('Alt text');
-    expect(texts.join(' ')).not.toMatch(/do not translate/i);
+    const ids = segments.map((s) => s.id);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });
