@@ -1,6 +1,8 @@
 'use server';
 
 import { Buffer } from 'node:buffer';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 
 import { createClient } from '@supabase/supabase-js';
 import { NextResponse } from 'next/server';
@@ -31,16 +33,99 @@ const getBearerToken = (request: Request): string | null => {
   return match?.[1]?.trim() || null;
 };
 
+const isBlockedIp = (address: string): boolean => {
+  const ipVersion = isIP(address);
+
+  if (ipVersion === 4) {
+    const [a, b] = address.split('.').map((n) => Number.parseInt(n, 10));
+    if (!Number.isFinite(a) || !Number.isFinite(b)) return true;
+
+    // Block: localhost, 127.0.0.0/8
+    if (a === 127) return true;
+    // Block: 10.0.0.0/8
+    if (a === 10) return true;
+    // Block: 172.16.0.0/12
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    // Block: 192.168.0.0/16
+    if (a === 192 && b === 168) return true;
+
+    return false;
+  }
+
+  if (ipVersion === 6) {
+    const normalized = address.toLowerCase();
+    if (normalized === '::1') return true; // localhost
+    if (normalized.startsWith('fe80:')) return true; // link-local
+    if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true; // unique local
+    if (normalized.startsWith('::ffff:')) return isBlockedIp(normalized.replace('::ffff:', ''));
+    return false;
+  }
+
+  return true;
+};
+
+const resolveHostAddresses = async (hostname: string): Promise<string[]> => {
+  if (isIP(hostname)) {
+    return [hostname];
+  }
+
+  const records = await lookup(hostname, { all: true, verbatim: true });
+  return records.map((record) => record.address);
+};
+
+const validateOutboundUrl = async (rawUrl: string): Promise<string> => {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error('Invalid URL.');
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error('Only http(s) URLs are allowed.');
+  }
+
+  if (parsed.username || parsed.password) {
+    throw new Error('URLs containing credentials are not allowed.');
+  }
+
+  const hostname = parsed.hostname?.toLowerCase() ?? '';
+  if (!hostname) {
+    throw new Error('Invalid URL hostname.');
+  }
+
+  if (hostname === 'localhost' || hostname.endsWith('.localhost')) {
+    throw new Error('Localhost URLs are not allowed.');
+  }
+
+  const addresses = await resolveHostAddresses(hostname);
+  if (addresses.length === 0) {
+    throw new Error('Unable to resolve URL hostname.');
+  }
+
+  if (addresses.some((address) => isBlockedIp(address))) {
+    throw new Error('URL resolves to a private or localhost address.');
+  }
+
+  return parsed.toString();
+};
+
 const fetchHtmlWithLimit = async (url: string): Promise<string> => {
+  const validatedUrl = await validateOutboundUrl(url);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
-    const response = await fetch(url, {
+    const response = await fetch(validatedUrl, {
       method: 'GET',
       headers: { Accept: 'text/html, application/xhtml+xml' },
       signal: controller.signal,
+      redirect: 'manual',
     });
+
+    if (response.status >= 300 && response.status < 400) {
+      throw new Error('Redirects are not allowed when fetching HTML.');
+    }
 
     if (!response.ok) {
       throw new Error(`Failed to fetch HTML (${response.status}).`);
