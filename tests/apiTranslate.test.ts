@@ -97,6 +97,11 @@ const createMockSupabaseClient = (db: MockDb) => {
           db[table].push(...rows.map(cloneRow));
           return Promise.resolve({ data: rows, error: null });
         },
+        upsert(payload: any) {
+          const rows = Array.isArray(payload) ? payload : [payload];
+          db[table].push(...rows.map(cloneRow));
+          return Promise.resolve({ data: rows, error: null });
+        },
       };
     },
     rpc(fnName: string, args: any) {

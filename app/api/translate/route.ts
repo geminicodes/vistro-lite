@@ -173,58 +173,30 @@ export async function POST(request: Request): Promise<Response> {
 
   const service = createSupabaseServiceClient();
 
-  const jobId = crypto.randomUUID();
-  const nowIso = new Date().toISOString();
+  // Transactional enqueue: job + segments + queue via Postgres function.
+  const idempotencyKeyRaw = request.headers.get('idempotency-key')?.trim() ?? '';
+  const idempotencyKey = idempotencyKeyRaw && idempotencyKeyRaw.length <= 128 ? idempotencyKeyRaw : null;
 
-  const { error: jobError } = await service.from('translation_jobs').insert({
-    id: jobId,
-    site_id: siteId,
-    source_url: url ?? null,
-    status: 'pending',
-    created_at: nowIso,
-    requested_segments: segments.length * targetLocales.length,
-    translated_segments: 0,
-  });
-
-  if (jobError) {
-    return NextResponse.json(
-      { error: { code: 'internal', message: `Failed to create translation job: ${jobError.message}` } },
-      { status: 500 },
-    );
-  }
-
-  const segmentPayload = segments.flatMap((segment) => {
+  const rpcSegments = segments.flatMap((segment) => {
     const segmentHash = sha256Hex(segment.text);
     return targetLocales.map((targetLang) => ({
-      id: crypto.randomUUID(),
-      job_id: jobId,
       source_lang: SOURCE_LANG_DEFAULT,
       target_lang: targetLang,
       segment_hash: segmentHash,
       source_text: segment.text,
-      translated_text: null,
-      created_at: nowIso,
     }));
   });
 
-  const { error: segmentError } = await service.from('translation_segments').insert(segmentPayload);
-  if (segmentError) {
-    return NextResponse.json(
-      { error: { code: 'internal', message: `Failed to enqueue translation segments: ${segmentError.message}` } },
-      { status: 500 },
-    );
-  }
-
-  // Enqueue job for worker processing.
-  const { error: queueError } = await service.from('job_queue').insert({
-    job_id: jobId,
-    enqueued_at: nowIso,
-    processed: false,
+  const { data: jobId, error: rpcError } = await service.rpc('enqueue_translation_job', {
+    p_site_id: siteId,
+    p_source_url: url ?? null,
+    p_idempotency_key: idempotencyKey,
+    p_segments: rpcSegments,
   });
 
-  if (queueError) {
+  if (rpcError || !jobId) {
     return NextResponse.json(
-      { error: { code: 'internal', message: `Failed to enqueue job: ${queueError.message}` } },
+      { error: { code: 'internal', message: `Failed to enqueue translation job: ${rpcError?.message ?? 'RPC failed.'}` } },
       { status: 500 },
     );
   }
